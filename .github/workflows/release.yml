@@ -1,0 +1,40 @@
+# Baut bei jedem Versions-Tag (z. B. v1.1.0) die exe und veröffentlicht sie als GitHub-Release.
+# Das Versand-Tool prüft diese Releases und aktualisiert sich selbst.
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Abhängigkeiten
+        run: python -m pip install pyinstaller pypdf
+
+      - name: Version aus Tag setzen
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}".TrimStart("v")
+          (Get-Content versand_tool.py -Encoding utf8) -replace '^APP_VERSION = ".*?"', "APP_VERSION = `"$v`"" |
+            Set-Content versand_tool.py -Encoding utf8
+          Select-String -Path versand_tool.py -Pattern '^APP_VERSION'
+
+      - name: exe bauen
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --hidden-import pypdf --name "BOB-Sendcloud-Versand" versand_tool.py
+
+      - name: Release veröffentlichen
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/BOB-Sendcloud-Versand.exe
+          generate_release_notes: true

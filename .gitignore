@@ -1,0 +1,15 @@
+# Build-Ausgaben
+build/
+dist/
+dist_*/
+*.spec
+__pycache__/
+*.pyc
+
+# Niemals hochladen: Zugangsdaten und Kundendaten
+.env
+*.env
+*.csv
+*.pdf
+*.json
+!.github/**
