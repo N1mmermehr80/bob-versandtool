@@ -5,6 +5,7 @@ name: Release
 on:
   push:
     tags: ["v*.*.*"]
+  workflow_dispatch:  # Testlauf: baut die exe, veröffentlicht aber kein Release
 
 permissions:
   contents: write
@@ -23,6 +24,7 @@ jobs:
         run: python -m pip install pyinstaller pypdf
 
       - name: Version aus Tag setzen
+        if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         run: |
           $v = "${{ github.ref_name }}".TrimStart("v")
@@ -34,6 +36,7 @@ jobs:
         run: python -m PyInstaller --noconfirm --clean --onefile --windowed --hidden-import pypdf --name "BOB-Sendcloud-Versand" versand_tool.py
 
       - name: Release veröffentlichen
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3
         with:
           files: dist/BOB-Sendcloud-Versand.exe
