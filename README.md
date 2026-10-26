@@ -2,13 +2,14 @@
 
 Holt offene Aufträge direkt aus Speed4Trade CONNECT (oder liest den S4T-Versandexport `GLS_*.csv`), legt ausgewählte Aufträge als DHL-Sendung bei Sendcloud an und meldet die Sendungsnummern an Speed4Trade zurück (bzw. exportiert sie als CSV).
 
-**Programm:** `dist\BOB-Sendcloud-Versand.exe` – eine einzelne Datei, keine Installation nötig.
+**Programm:** Ordner mit `BOB-Sendcloud-Versand.exe` und Unterordner `_internal` (aus `BOB-Sendcloud-Versand.zip` im Release), z. B. `C:\BOB-Versandtool\`. Keine Installation nötig, gestartet wird die exe im Ordner (am besten per Verknüpfung). Die Ordner-Variante startet in rund 1 Sekunde, weil sie sich nicht bei jedem Start entpacken muss.
 
 ## Ablauf
 
 1. **Aus S4T abholen:** Holt alle Aufträge mit Status 130 „bezahlt, Versand offen“ aus Speed4Trade. Alternativ **CSV importieren…** für den S4T-Export.
 2. **Prüfen:** Farbe der Zeile beachten (siehe unten). Per Doppelklick lassen sich Adresse, Paketanzahl und Gewicht ändern.
 3. **Auswählen:** Kästchen in der ersten Spalte anklicken (oder Leertaste), das Kästchen im Spaltenkopf wählt alle angezeigten aus bzw. ab. Alternativ „Alle auswählen“. Fehlerhafte und zu prüfende Aufträge werden dabei nicht automatisch erfasst. Versendete Aufträge zeigen einen grünen Haken.
+   - **Sortieren:** Klick auf eine Spaltenüberschrift sortiert aufsteigend (▲), erneuter Klick absteigend (▼), ein dritter stellt die ursprüngliche Reihenfolge wieder her. Leere Werte stehen immer unten.
    - **Einzeln senden:** „▸ Senden“ in der Zeile oder „Diesen Auftrag senden“ im Detailbereich sendet genau diesen Auftrag (mit derselben Sicherheitsabfrage).
 4. **🚚 Senden:** Ausgewählte Aufträge an Sendcloud senden. Die Sendungen werden bei DHL angemeldet, die Labels liegen danach zum Drucken im Sendcloud-Panel.
 5. **🖨 Labels drucken:** Die Label-PDFs werden beim Senden automatisch ins Programm geladen. Hier lassen sie sich gesammelt drucken:
@@ -121,9 +122,12 @@ Bei mehreren Paketen wird je Paket eine eigene Sendung mit derselben Auftragsnum
 ## Updates und neue Versionen (GitHub)
 
 Das Tool prüft beim Start und danach alle 6 Stunden, ob es auf GitHub eine neuere Version gibt. Wenn ja, erscheint oben ein gelber Hinweis mit **„Jetzt aktualisieren“**:
-- Die neue exe wird heruntergeladen und mit der Prüfsumme von GitHub verglichen.
-- Danach tauscht sich das Tool selbst aus und startet neu.
-- Adminrechte sind nicht nötig, solange die exe in einem Ordner liegt, in den der Benutzer schreiben darf, z. B. Desktop oder `%LOCALAPPDATA%`.
+- Das Paket (ZIP) wird heruntergeladen, mit der Prüfsumme von GitHub verglichen, nach `_update
+eu` im Programmordner entpackt und auf Vollständigkeit geprüft.
+- Das Tool beendet sich. Die neue Version wartet, bis es zu ist, sichert die alte als `*.alt`, kopiert sich in den Programmordner und startet. Geht dabei etwas schief (z. B. eine Datei ist gesperrt), stellt sie die alte Version wieder her und startet diese.
+- `*.alt` und `_update` werden beim nächsten Start aufgeräumt.
+- **Umstellung von der Einzel-exe (bis 1.0.6):** Diese Versionen aktualisieren sich zunächst auf die neue Einzel-exe. Die bietet dann „Schnellere Programmversion verfügbar“ an und stellt auf die Ordner-Variante um, im selben Ordner.
+- Adminrechte sind nicht nötig, solange der Programmordner für den Benutzer beschreibbar ist (z. B. `C:\BOB-Versandtool`, nicht `C:\Program Files`).
 - Die Arbeitsliste bleibt erhalten.
 
 Unter **Einstellungen → Updates** stehen die installierte Version, das Repository und „Jetzt nach Updates suchen“.
@@ -139,11 +143,11 @@ git commit -am "Beschreibung der Änderung"
 git tag v1.1.0
 git push --tags
 ```
-GitHub Actions (`.github/workflows/release.yml`) baut daraus automatisch die exe, setzt die Versionsnummer aus dem Tag und veröffentlicht ein Release. Wenige Minuten später bieten alle Arbeitsplätze das Update an. Die Versionsnummer muss dabei steigen, z. B. v1.0.0 → v1.1.0.
+GitHub Actions (`.github/workflows/release.yml`) baut daraus automatisch die Ordner-Variante als ZIP und übergangsweise die Einzel-exe, prüft das Paket, setzt die Versionsnummer aus dem Tag und veröffentlicht ein Release. Ein Testlauf ohne Release (Actions → Release → Run workflow) stellt ZIP und exe drei Tage als Download bereit. Wenige Minuten später bieten alle Arbeitsplätze das Update an. Die Versionsnummer muss dabei steigen, z. B. v1.0.0 → v1.1.0.
 
 ## Lokal bauen
 
-`build.bat` ausführen. Voraussetzung: Python 3 mit `pip install pyinstaller pypdf`.
+`build.bat` ausführen. Voraussetzung: Python 3 mit `pip install pyinstaller pypdf pypdfium2==5.14.0`. Hinweis: Mit der Python-Version aus dem Microsoft Store fehlt in der Ordner-Variante teils `python313.dll` – für Releases baut deshalb GitHub.
 
 Test ohne Oberfläche und ohne Sendungen anzulegen:
 

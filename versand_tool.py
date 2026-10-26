@@ -1398,8 +1398,11 @@ def run_installer(target, pid):
         for p in moved:
             if os.path.exists(p + ".alt"):
                 os.replace(p + ".alt", p)
-        ctypes.windll.user32.MessageBoxW(None, f"Update konnte nicht installiert werden:\n{e}\n\n"
-                                               "Die bisherige Version wird wieder gestartet.", APP_NAME, 0x10)
+        reason = ("Eine Programmdatei ist noch geöffnet oder gesperrt (z. B. ein zweites Fenster des Tools oder der "
+                  "Virenscanner)." if isinstance(e, PermissionError) else str(e))
+        ctypes.windll.user32.MessageBoxW(None, f"Das Update konnte nicht installiert werden.\n\n{reason}\n\n"
+                                               "Die bisherige Version bleibt erhalten und wird wieder gestartet. "
+                                               "Das Update wird später erneut angeboten.", APP_NAME, 0x10)
         if os.path.exists(t_exe):
             subprocess.Popen([start_exe], cwd=target, env=env, close_fds=True)
         return 1
@@ -1599,8 +1602,10 @@ class App(tk.Tk):
         self.tree = ttk.Treeview(frm, columns=[c[0] for c in COLS], show="tree headings", selectmode="browse")
         self.tree.column("#0", width=38, minwidth=38, stretch=False, anchor="center")
         self.tree.heading("#0", image=self.icons["box"], command=self._toggle_all)
+        self._sort = (None, False)  # (Spalte, absteigend) – Klick auf Überschrift: auf-, absteigend, aus
         for key, title, w in COLS:
-            self.tree.heading(key, text=title, anchor="w" if key not in ("value", "weight") else "e")
+            self.tree.heading(key, text=title, anchor="w" if key not in ("value", "weight") else "e",
+                              command=lambda k=key: self._sort_by(k))
             self.tree.column(key, width=w, minwidth=30, stretch=key in ("name", "street", "items"),
                              anchor="center" if key == "country" else
                              "e" if key in ("value", "weight") else "w")
@@ -1759,7 +1764,12 @@ class App(tk.Tk):
         keep = keep or self.tree.focus()
         self.tree.delete(*self.tree.get_children())
         shown = 0
-        for i, o in enumerate(self.orders):
+        rows = list(enumerate(self.orders))
+        if self._sort[0]:
+            keyed = [(self._sort_key(o, self._sort[0]), i, o) for i, o in rows]
+            filled = sorted((k for k in keyed if not k[0][0]), key=lambda k: k[0], reverse=self._sort[1])
+            rows = [(i, o) for _, i, o in filled] + [(i, o) for k, i, o in keyed if k[0]]  # Leeres immer unten
+        for i, o in rows:
             if self._visible(o):
                 self.tree.insert("", "end", iid=str(i), image=self._box_icon(o), values=self._row_values(o),
                                  tags=(self._tag(o),))
@@ -1792,6 +1802,26 @@ class App(tk.Tk):
         shown = [self.orders[int(i)] for i in self.tree.get_children()]
         eligible = [o for o in shown if self._auto_selectable(o)]
         return bool(eligible) and all(o.selected for o in eligible)
+
+    def _sort_by(self, key):
+        col, desc = self._sort
+        self._sort = (key, False) if col != key else (key, True) if not desc else (None, False)
+        for k, title, _ in COLS:
+            arrow = "" if k != self._sort[0] else " ▼" if self._sort[1] else " ▲"
+            self.tree.heading(k, text=title + arrow)
+        self.refresh()
+
+    def _sort_key(self, o, key):
+        """Sortierwert je Spalte: Zahlen numerisch, Text ohne Groß-/Kleinschreibung, Leeres immer zuletzt."""
+        num = {"value": o.value, "weight": o.weight * o.parcels,
+               "ref": int(o.ref) if o.ref.isdigit() else None,
+               "send": 0 if self._can_send(o) else 1}
+        if key in num:
+            v = num[key]
+            return (v is None, v if v is not None else 0, o.ref)
+        text = {"label": o.printed or ("bereit" if o.labels else ""), "items": o.items_text}.get(key, getattr(o, key, ""))
+        text = str(text or "").strip().lower()
+        return (text == "", text, o.ref)
 
     def _update_head_box(self):
         """Kopf der Auswahlspalte: angehakt, wenn alle angezeigten auswählbaren Aufträge ausgewählt sind."""
