@@ -1057,7 +1057,7 @@ class App(tk.Tk):
         sbar.pack(fill="x")
         box = tk.Frame(sbar, bg=C["paper"], highlightthickness=1, highlightbackground=C["line_strong"],
                        highlightcolor=C["steel"])
-        box.pack(side="left")
+        box.grid(row=0, column=0, sticky="w")
         tk.Label(box, text="⌕", bg=C["paper"], fg=C["muted"], font=(F["body"][0], 13)).pack(side="left", padx=(8, 2))
         self.search = tk.StringVar()
         self.search_entry = tk.Entry(box, textvariable=self.search, width=34, relief="flat", bd=0, bg=C["paper"],
@@ -1074,13 +1074,27 @@ class App(tk.Tk):
 
         self.filter = tk.StringVar(value=FILTERS[0])
         self.tabs = FilterTabs(sbar, self.filter, lambda: self.refresh())
-        self.tabs.pack(side="left", padx=(22, 0))
+        sbar.columnconfigure(2, weight=1)
+        self.count_label = tk.Label(sbar, text="", bg=C["hall"], fg=C["amber_ink"], font=F["small"])
+        self.count_label.grid(row=0, column=3, sticky="e", padx=(0, 14))
         sel = tk.Frame(sbar, bg=C["hall"])
-        sel.pack(side="right")
+        sel.grid(row=0, column=4, sticky="e")
         FlatButton(sel, "Alle auswählen", lambda: self.select_all(True), "ghost").pack(side="left")
         FlatButton(sel, "Keine", lambda: self.select_all(False), "ghost").pack(side="left", padx=(2, 0))
-        self.count_label = tk.Label(sbar, text="", bg=C["hall"], fg=C["amber_ink"], font=F["small"])
-        self.count_label.pack(side="right", padx=(0, 14))
+
+        def place_tabs(e=None, state={"inline": None}):
+            # Reiter neben der Suche, wenn alles passt (inkl. Platz für „n ausgewählt“), sonst in eigener Zeile
+            need = box.winfo_reqwidth() + self.tabs.winfo_reqwidth() + sel.winfo_reqwidth() + 22 + 14 + 120
+            inline = sbar.winfo_width() - 28 >= need
+            if inline == state["inline"]:
+                return
+            state["inline"] = inline
+            if inline:
+                self.tabs.grid(row=0, column=1, sticky="w", padx=(22, 0), pady=0)
+            else:
+                self.tabs.grid(row=1, column=0, columnspan=5, sticky="w", padx=0, pady=(8, 0))
+        sbar.bind("<Configure>", place_tabs)
+        place_tabs()
 
         self.search.trace_add("write", lambda *a: self.refresh())
         self.search_entry.bind("<Escape>", lambda e: self.search.set(""))
@@ -1146,22 +1160,39 @@ class App(tk.Tk):
             cards.columnconfigure(col, weight=weight, uniform="cards")
             col += 1
 
-        # ── Statuszeile mit kompakter Farblegende
+        # ── Statuszeile mit kompakter Farblegende (bei schmalem Fenster in eigener Zeile darunter)
         sb = tk.Frame(self, bg=C["hall"], padx=14, pady=8)
-        sb.pack(fill="x")
+        sb.pack(side="bottom", fill="x", before=frm)  # vor der Tabelle: bleibt auch bei wenig Höhe sichtbar
+        sb.columnconfigure(1, weight=1)
         self.status = tk.StringVar(value="Keine Datei geladen. Mit „Importieren…“ einen S4T-Export laden.")
         self.share_label = tk.Label(sb, text="", bg=C["hall"], fg=C["muted"], font=F["body_b"])
-        self.share_label.pack(side="left", padx=(0, 16))
-        tk.Label(sb, textvariable=self.status, bg=C["hall"], fg=C["muted"], font=F["small"]).pack(side="left")
+        self.share_label.grid(row=0, column=0, sticky="w", padx=(0, 16))
+        tk.Label(sb, textvariable=self.status, bg=C["hall"], fg=C["muted"], font=F["small"],
+                 anchor="w").grid(row=0, column=1, sticky="ew")
         self.progress = ttk.Progressbar(sb, length=180, mode="determinate", style="Signal.Horizontal.TProgressbar")
-        self.progress.pack(side="right")
+        self.progress.grid(row=0, column=3, sticky="e")
         legend = tk.Frame(sb, bg=C["hall"])
-        legend.pack(side="right", padx=(0, 18))
+        tk.Label(legend, text="Farben:", bg=C["hall"], fg=C["muted"], font=F["small"]).pack(side="left", padx=(0, 6))
         for bg, fg, txt in ((C["amber_bg"], C["amber_ink"], "prüfen"), (C["red_bg"], C["red_ink"], "nicht sendbar"),
                             (C["green_bg"], C["green_ink"], "Label erstellt"),
                             (C["blue_bg"], C["blue_ink"], "war schon in Sendcloud"),
                             (C["violet_bg"], C["violet_ink"], "manuell versendet")):
             tk.Label(legend, text=txt, bg=bg, fg=fg, font=F["small"], padx=6).pack(side="left", padx=(0, 4))
+
+        def place_legend(e=None, state={"inline": None}):
+            # Platz für Freigabe-Info, Legende, Fortschritt und mind. 420 px Statustext
+            need = (self.share_label.winfo_reqwidth() + legend.winfo_reqwidth() + self.progress.winfo_reqwidth()
+                    + 420 + 60)
+            inline = sb.winfo_width() >= need
+            if inline == state["inline"]:
+                return
+            state["inline"] = inline
+            if inline:
+                legend.grid(row=0, column=2, sticky="e", padx=(18, 18), pady=0)
+            else:
+                legend.grid(row=1, column=0, columnspan=4, sticky="w", padx=0, pady=(6, 0))
+        sb.bind("<Configure>", place_legend)
+        place_legend()
 
     # ----- Tabelle
     def _row_values(self, o):
