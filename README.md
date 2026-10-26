@@ -8,7 +8,8 @@ Holt offene Aufträge direkt aus Speed4Trade CONNECT (oder liest den S4T-Versand
 
 1. **Aus S4T abholen:** Holt alle Aufträge mit Status 130 „bezahlt, Versand offen“ aus Speed4Trade. Alternativ **CSV importieren…** für den S4T-Export.
 2. **Prüfen:** Farbe der Zeile beachten (siehe unten). Per Doppelklick lassen sich Adresse, Paketanzahl und Gewicht ändern.
-3. **Auswählen:** Häkchen in der ersten Spalte setzen (Klick oder Leertaste) oder „Alle auswählen“ nutzen.
+3. **Auswählen:** Kästchen in der ersten Spalte anklicken (oder Leertaste), das Kästchen im Spaltenkopf wählt alle angezeigten aus bzw. ab. Alternativ „Alle auswählen“. Fehlerhafte und zu prüfende Aufträge werden dabei nicht automatisch erfasst. Versendete Aufträge zeigen einen grünen Haken.
+   - **Einzeln senden:** „▸ Senden“ in der Zeile oder „Diesen Auftrag senden“ im Detailbereich sendet genau diesen Auftrag (mit derselben Sicherheitsabfrage).
 4. **🚚 Senden:** Ausgewählte Aufträge an Sendcloud senden. Die Sendungen werden bei DHL angemeldet, die Labels liegen danach zum Drucken im Sendcloud-Panel.
 5. **🖨 Labels drucken:** Die Label-PDFs werden beim Senden automatisch ins Programm geladen. Hier lassen sie sich gesammelt drucken:
    - **Drucken…** öffnet den Windows-Druckdialog (Drucker, Eigenschaften, Exemplare) und druckt direkt, ohne PDF-Programm. Der gewählte Drucker wird je Format (A6/A4) gemerkt und beim nächsten Mal vorausgewählt. Mit „Ohne Druckdialog direkt drucken“ in den Einstellungen geht der Druck sofort an diesen Drucker.

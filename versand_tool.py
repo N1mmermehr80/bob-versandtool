@@ -1330,7 +1330,7 @@ def append_log(o: Order, note):
 
 # --------------------------------------------------------------------------- Oberfläche
 
-COLS = [("sel", "", 34), ("ref", "Auftrag", 70), ("name", "Name", 170), ("company", "Firma", 120),
+COLS = [("send", "", 84), ("ref", "Auftrag", 70), ("name", "Name", 170), ("company", "Firma", 120),
         ("street", "Straße", 150), ("house", "Nr.", 50), ("zip", "PLZ", 60), ("city", "Ort", 120),
         ("country", "Land", 45), ("items", "Artikel", 200), ("value", "Wert €", 75),
         ("weight", "Gewicht kg", 80), ("status", "Status", 120), ("label", "Label", 95),
@@ -1478,12 +1478,15 @@ class App(tk.Tk):
         # ── Tabelle
         frm = tk.Frame(self, bg=C["line"], padx=1, pady=1)
         frm.pack(fill="both", expand=True, padx=14)
-        self.tree = ttk.Treeview(frm, columns=[c[0] for c in COLS], show="headings", selectmode="browse")
+        # Spalte #0 (Baumspalte) trägt das Auswahl-Icon – nur sie kann Bilder anzeigen
+        self.icons = {k: tk.PhotoImage(data=icon_png(k)) for k in ("box", "box_on", "box_off", "done")}
+        self.tree = ttk.Treeview(frm, columns=[c[0] for c in COLS], show="tree headings", selectmode="browse")
+        self.tree.column("#0", width=38, minwidth=38, stretch=False, anchor="center")
+        self.tree.heading("#0", image=self.icons["box"], command=self._toggle_all)
         for key, title, w in COLS:
-            self.tree.heading(key, text=title, anchor="w" if key not in ("value", "weight", "sel") else
-                              "e" if key != "sel" else "center")
+            self.tree.heading(key, text=title, anchor="w" if key not in ("value", "weight") else "e")
             self.tree.column(key, width=w, minwidth=30, stretch=key in ("name", "street", "items"),
-                             anchor="center" if key in ("sel", "country") else
+                             anchor="center" if key == "country" else
                              "e" if key in ("value", "weight") else "w")
         ys = ttk.Scrollbar(frm, orient="vertical", command=self.tree.yview)
         xs = ttk.Scrollbar(frm, orient="horizontal", command=self.tree.xview)
@@ -1503,7 +1506,8 @@ class App(tk.Tk):
         self.tree.bind("<Button-3>", self._context_menu)
         self.tree.bind("<Delete>", lambda e: self.delete_orders())
         self.tree.bind("<Double-1>", lambda e: self.edit_current() if self.tree.identify_region(e.x, e.y) == "cell"
-                       and self.tree.identify_column(e.x) != "#1" else None)
+                       and self.tree.identify_column(e.x) not in ("#0", "#1") else None)
+        self.tree.bind("<Motion>", self._hover)
         self.tree.bind("<space>", lambda e: self._toggle(self.tree.focus()))
         self.tree.bind("<<TreeviewSelect>>", lambda e: self._show_details())
 
@@ -1518,6 +1522,9 @@ class App(tk.Tk):
         self.det_name.pack(side="left", padx=(12, 0), pady=(3, 0))
         self.det_badge = tk.Label(head, text="", font=F["badge"], padx=10, pady=2, bg=C["paper"])
         self.det_badge.pack(side="left", padx=(14, 0), pady=(3, 0))
+        self.det_send = FlatButton(head, "Diesen Auftrag senden",
+                                   lambda: self.tree.focus() and self.send_one(self.orders[int(self.tree.focus())]),
+                                   "primary")
         tk.Frame(det, bg=C["line"], height=1).pack(fill="x")
         cards = tk.Frame(det, bg=C["paper"])
         cards.pack(fill="x")
@@ -1568,8 +1575,19 @@ class App(tk.Tk):
         place_legend()
 
     # ----- Tabelle
+    @staticmethod
+    def _can_send(o):
+        return not (o.done or o.tracking or o.busy_elsewhere or o.status == "wird gesendet…" or o.validate())
+
+    def _box_icon(self, o):
+        if o.done:
+            return self.icons["done"]
+        if o.busy_elsewhere or o.tracking:
+            return self.icons["box_off"]
+        return self.icons["box_on" if o.selected else "box"]
+
     def _row_values(self, o):
-        return ("☑" if o.selected else "☐", o.ref, o.name, o.company, o.street, o.house, o.zip, o.city,
+        return ("▶  Senden" if self._can_send(o) else "", o.ref, o.name, o.company, o.street, o.house, o.zip, o.city,
                 o.country, o.items_text, f"{o.value:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."),
                 o.weight_text, o.status + (f" ({o.locked_by})" if o.busy_elsewhere else ""), self._label_text(o),
                 o.tracking)
@@ -1627,7 +1645,8 @@ class App(tk.Tk):
         shown = 0
         for i, o in enumerate(self.orders):
             if self._visible(o):
-                self.tree.insert("", "end", iid=str(i), values=self._row_values(o), tags=(self._tag(o),))
+                self.tree.insert("", "end", iid=str(i), image=self._box_icon(o), values=self._row_values(o),
+                                 tags=(self._tag(o),))
                 shown += 1
         if keep and self.tree.exists(keep):
             self.tree.focus(keep)
@@ -1644,8 +1663,26 @@ class App(tk.Tk):
             self._nosearch = False
         self.filter.set(current)
         self.tabs.update_counts(counts)
+        self._update_head_box()
         self._show_details()
         self._update_status()
+
+    @staticmethod
+    def _auto_selectable(o):
+        """Wird von „Alle auswählen“ erfasst (fehlerhafte und zu prüfende Aufträge nicht)."""
+        return not (o.done or o.tracking or o.validate() or o.needs_review or o.busy_elsewhere)
+
+    def _head_on(self):
+        shown = [self.orders[int(i)] for i in self.tree.get_children()]
+        eligible = [o for o in shown if self._auto_selectable(o)]
+        return bool(eligible) and all(o.selected for o in eligible)
+
+    def _update_head_box(self):
+        """Kopf der Auswahlspalte: angehakt, wenn alle angezeigten auswählbaren Aufträge ausgewählt sind."""
+        self.tree.heading("#0", image=self.icons["box_on" if self._head_on() else "box"])
+
+    def _toggle_all(self):
+        self.select_all(not self._head_on())
 
     def _search_text(self):
         ph = getattr(self, "search_ph", None)
@@ -1662,7 +1699,8 @@ class App(tk.Tk):
     def _update_row(self, i):
         if self.tree.exists(str(i)):
             o = self.orders[i]
-            self.tree.item(str(i), values=self._row_values(o), tags=(self._tag(o),))
+            self.tree.item(str(i), image=self._box_icon(o), values=self._row_values(o), tags=(self._tag(o),))
+            self._update_head_box()
 
     def _update_status(self, extra=""):
         if not self.orders:
@@ -1675,9 +1713,20 @@ class App(tk.Tk):
                         f"{done} versendet, {bad} nicht sendbar, {unprinted} Labels ungedruckt. {extra}")
 
     def _click(self, e):
-        if self.tree.identify_region(e.x, e.y) == "cell" and self.tree.identify_column(e.x) == "#1":
-            self._toggle(self.tree.identify_row(e.y))
+        region, col, iid = self.tree.identify_region(e.x, e.y), self.tree.identify_column(e.x), self.tree.identify_row(e.y)
+        if region in ("tree", "cell") and col == "#0" and iid:
+            self._toggle(iid)
             return "break"
+        if region == "cell" and col == "#1" and iid and self._can_send(self.orders[int(iid)]):
+            self.tree.focus(iid)
+            self.tree.selection_set(iid)
+            self.send_one(self.orders[int(iid)])
+            return "break"
+
+    def _hover(self, e):
+        col, iid = self.tree.identify_column(e.x), self.tree.identify_row(e.y)
+        hand = bool(iid) and (col == "#0" or (col == "#1" and self._can_send(self.orders[int(iid)])))
+        self.tree.configure(cursor="hand2" if hand else "")
 
     def _toggle(self, iid):
         if not iid or self.busy:
@@ -1705,8 +1754,7 @@ class App(tk.Tk):
         visible = [o for o in self.orders if self._visible(o)]  # bei aktiver Suche nur die angezeigten
         for o in visible:
             was = o.selected
-            o.selected = on and not o.done and not o.tracking and not o.validate() and not o.needs_review \
-                and not o.busy_elsewhere
+            o.selected = on and self._auto_selectable(o)
             if o.selected and not was:
                 o.pick = self._next_pick()
             elif not o.selected and not o.done:
@@ -1723,11 +1771,17 @@ class App(tk.Tk):
             self.det_title.configure(text="")
             self.det_name.configure(text="Kein Auftrag ausgewählt – Zeile anklicken für Details")
             self.det_badge.configure(text="", bg=C["paper"])
+            self.det_send.pack_forget()
             for c in self.cards.values():
                 c.show([])
             return
         o = self.orders[int(iid)]
         err = o.validate()
+        if self._can_send(o):
+            self.det_send.pack(side="right")
+            self.det_send.state(["disabled"] if self.busy else ["!disabled"])
+        else:
+            self.det_send.pack_forget()
 
         self.det_title.configure(text=o.ref)
         self.det_name.configure(text=o.company or o.name)
@@ -2129,6 +2183,15 @@ class App(tk.Tk):
         if not sel:
             messagebox.showinfo(APP_NAME, "Keine Aufträge ausgewählt (Häkchen in der ersten Spalte).")
             return
+        self._send(sel)
+
+    def send_one(self, o):
+        """„Senden“ direkt am Auftrag (Spalte in der Liste oder Knopf im Detailbereich)."""
+        if self.busy or not self._can_send(o):
+            return
+        self._send([o])
+
+    def _send(self, sel):
         bad = [o for o in sel if o.validate()]
         if bad:
             messagebox.showwarning(APP_NAME, "Diese Aufträge sind nicht sendbar und werden übersprungen:\n\n" +
@@ -2972,6 +3035,63 @@ def apply_theme(root):
     root.option_add("*Menu.font", F["body"])
     root.option_add("*Menu.relief", "flat")
     root.option_add("*Text.font", F["body"])
+
+
+def icon_png(kind, px=18):
+    """Kantengeglättete Auswahl-Icons als PNG (ohne Bildbibliothek): 'box' leer, 'box_on' angehakt (Signalgelb),
+    'box_off' gesperrt, 'done' grüner Haken für versendete Aufträge."""
+    import zlib
+    import struct
+    rgb = lambda h: tuple(int(h[i:i + 2], 16) for i in (1, 3, 5))
+    k = px / 18
+    c, half, rad, bw = px / 2, px / 2 - 1.5 * k, 4 * k, 1.4 * k
+    check = [(4.6 * k, 9.4 * k), (7.6 * k, 12.4 * k), (13.4 * k, 5.9 * k)]
+    fill, border, mark, stroke = {
+        "box": (C["paper"], C["line_strong"], None, 0),
+        "box_on": (C["signal"], "#C99600", C["ink"], 1.15 * k),
+        "box_off": (C["hall"], C["line"], None, 0),
+        "done": (None, None, C["green_ink"], 1.35 * k),
+    }[kind]
+
+    def rrect(x, y):  # Abstand zum abgerundeten Quadrat (negativ = innen)
+        qx, qy = abs(x - c) - half + rad, abs(y - c) - half + rad
+        return (max(qx, 0) ** 2 + max(qy, 0) ** 2) ** 0.5 + min(max(qx, qy), 0) - rad
+
+    def on_check(x, y):
+        for (ax, ay), (bx, by) in zip(check, check[1:]):
+            dx, dy = bx - ax, by - ay
+            t = max(0.0, min(1.0, ((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy)))
+            if (x - ax - t * dx) ** 2 + (y - ay - t * dy) ** 2 <= stroke ** 2:
+                return True
+        return False
+
+    ss, raw = 4, bytearray()
+    for py in range(px):
+        raw.append(0)
+        for px_ in range(px):
+            acc = [0.0, 0.0, 0.0, 0.0]  # vormultipliziert
+            for sy in range(ss):
+                for sx in range(ss):
+                    x, y = px_ + (sx + .5) / ss, py + (sy + .5) / ss
+                    col = None
+                    d = rrect(x, y) if fill else 1
+                    if d <= 0:
+                        col = border if d > -bw else fill
+                    if mark and on_check(x, y):
+                        col = mark
+                    if col:
+                        r, g, b = rgb(col)
+                        acc[0] += r; acc[1] += g; acc[2] += b; acc[3] += 1
+            n = ss * ss
+            a = acc[3] / n
+            raw += bytes([round(acc[0] / acc[3]), round(acc[1] / acc[3]), round(acc[2] / acc[3]), round(a * 255)]
+                         if acc[3] else [0, 0, 0, 0])
+
+    def chunk(t, data):
+        return struct.pack(">I", len(data)) + t + data + struct.pack(">I", zlib.crc32(t + data) & 0xFFFFFFFF)
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", px, px, 8, 6, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b""))
+    return base64.b64encode(png)
 
 
 class FlatButton(tk.Label):
