@@ -10,7 +10,10 @@ Holt offene Aufträge direkt aus Speed4Trade CONNECT (oder liest den S4T-Versand
 2. **Prüfen:** Farbe der Zeile beachten (siehe unten). Per Doppelklick lassen sich Adresse, Paketanzahl und Gewicht ändern.
 3. **Auswählen:** Häkchen in der ersten Spalte setzen (Klick oder Leertaste) oder „Alle auswählen“ nutzen.
 4. **🚚 Senden:** Ausgewählte Aufträge an Sendcloud senden. Die Sendungen werden bei DHL angemeldet, die Labels liegen danach zum Drucken im Sendcloud-Panel.
-5. **🖨 Labels drucken:** Die Label-PDFs werden beim Senden automatisch ins Programm geladen. Hier lassen sie sich zu einem Sammel-PDF zusammenfassen:
+5. **🖨 Labels drucken:** Die Label-PDFs werden beim Senden automatisch ins Programm geladen. Hier lassen sie sich gesammelt drucken:
+   - **Drucken…** öffnet den Windows-Druckdialog (Drucker, Eigenschaften, Exemplare) und druckt direkt, ohne PDF-Programm. Der gewählte Drucker wird je Format (A6/A4) gemerkt und beim nächsten Mal vorausgewählt. Mit „Ohne Druckdialog direkt drucken“ in den Einstellungen geht der Druck sofort an diesen Drucker.
+   - **Als PDF öffnen** zeigt das Sammel-PDF wie bisher im PDF-Programm.
+   - Bricht man den Druckdialog ab, bleiben die Labels als ungedruckt markiert.
    - Auswahl: alle ungedruckten, nur angehakte oder die markierte Zeile
    - Reihenfolge im Sammel-PDF: so, wie die Aufträge vor dem Senden angehakt wurden (auch über mehrere Sendevorgänge). Aufträge ohne Häkchen-Reihenfolge, z. B. von Kollegen gesendet, kommen danach in Listenreihenfolge.
    - Format: A6 für den Etikettendrucker oder A4 für den Bürodrucker (mehrere Labels pro Seite)

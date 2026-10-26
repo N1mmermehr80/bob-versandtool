@@ -21,7 +21,7 @@ jobs:
           python-version: "3.13"
 
       - name: Abhängigkeiten
-        run: python -m pip install pyinstaller pypdf
+        run: python -m pip install pyinstaller pypdf "pypdfium2==5.14.0"
 
       - name: Version aus Tag setzen
         if: startsWith(github.ref, 'refs/tags/')
@@ -33,7 +33,7 @@ jobs:
           Select-String -Path versand_tool.py -Pattern '^APP_VERSION'
 
       - name: exe bauen
-        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --hidden-import pypdf --name "BOB-Sendcloud-Versand" versand_tool.py
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --hidden-import pypdf --collect-all pypdfium2 --collect-all pypdfium2_raw --name "BOB-Sendcloud-Versand" versand_tool.py
 
       - name: Release veröffentlichen
         if: startsWith(github.ref, 'refs/tags/')

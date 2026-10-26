@@ -71,6 +71,8 @@ DEFAULTS = {
     "update_repo": "",
     "label_paper": "A6",
     "print_direct": "0",
+    "printer_a6": "",          # zuletzt gewählter Drucker je Format (pro PC)
+    "printer_a4": "",
     "save_label_pdf": "0",
     "label_dir": "",
     # Speed4Trade CONNECT (Webservice) – ebenfalls firmenspezifisch, daher leer
@@ -805,6 +807,138 @@ def s4t_order(x, default_weight):
     _set_weight(o, grams / 1000 if grams else None, default_weight)
     o.hints.insert(0, "Aus Speed4Trade abgeholt" + (f", eBay-Bestellung {o.ebay}" if o.ebay else ""))
     return o
+
+
+# --------------------------------------------------------------------------- Direkter Druck (ohne PDF-Programm)
+
+class PrintCancelled(Exception):
+    pass
+
+
+def _gdi():
+    """Windows-Druck-APIs mit korrekten 64-bit-Typen (sonst werden Handles abgeschnitten)."""
+    from ctypes import wintypes as W
+    k32, gdi, cdlg = ctypes.windll.kernel32, ctypes.windll.gdi32, ctypes.windll.comdlg32
+    vp = ctypes.c_void_p
+    k32.GlobalAlloc.argtypes, k32.GlobalAlloc.restype = [W.UINT, ctypes.c_size_t], vp
+    k32.GlobalLock.argtypes, k32.GlobalLock.restype = [vp], vp
+    k32.GlobalUnlock.argtypes, k32.GlobalFree.argtypes = [vp], [vp]
+    gdi.StartDocW.argtypes = [vp, vp]
+    for f in (gdi.StartPage, gdi.EndPage, gdi.EndDoc, gdi.DeleteDC):
+        f.argtypes = [vp]
+    gdi.GetDeviceCaps.argtypes = [vp, ctypes.c_int]
+    gdi.StretchDIBits.argtypes = [vp] + [ctypes.c_int] * 8 + [vp, vp, W.UINT, W.DWORD]
+    cdlg.PrintDlgW.argtypes = [vp]
+    return k32, gdi, cdlg
+
+
+class _PRINTDLGW(ctypes.Structure):
+    _pack_ = 1 if ctypes.sizeof(ctypes.c_void_p) == 4 else 8
+    _fields_ = [("lStructSize", ctypes.c_uint32), ("hwndOwner", ctypes.c_void_p), ("hDevMode", ctypes.c_void_p),
+                ("hDevNames", ctypes.c_void_p), ("hDC", ctypes.c_void_p), ("Flags", ctypes.c_uint32),
+                ("nFromPage", ctypes.c_uint16), ("nToPage", ctypes.c_uint16), ("nMinPage", ctypes.c_uint16),
+                ("nMaxPage", ctypes.c_uint16), ("nCopies", ctypes.c_uint16), ("hInstance", ctypes.c_void_p),
+                ("lCustData", ctypes.c_void_p), ("lpfnPrintHook", ctypes.c_void_p),
+                ("lpfnSetupHook", ctypes.c_void_p), ("lpPrintTemplateName", ctypes.c_void_p),
+                ("lpSetupTemplateName", ctypes.c_void_p), ("hPrintTemplate", ctypes.c_void_p),
+                ("hSetupTemplate", ctypes.c_void_p)]
+
+
+def _devnames(k32, printer):
+    """DEVNAMES-Block, damit der Druckdialog den zuletzt benutzten Drucker vorauswählt."""
+    text = "\0" + printer + "\0\0"
+    raw = ctypes.create_string_buffer(8 + len(text) * 2)
+    ctypes.memmove(ctypes.addressof(raw), (ctypes.c_uint16 * 4)(4, 5, 6 + len(printer), 0), 8)
+    ctypes.memmove(ctypes.addressof(raw) + 8, text.encode("utf-16-le"), len(text) * 2)
+    h = k32.GlobalAlloc(0x0042, len(raw))  # GMEM_MOVEABLE | GMEM_ZEROINIT
+    ctypes.memmove(k32.GlobalLock(h), raw, len(raw))
+    k32.GlobalUnlock(h)
+    return h
+
+
+def print_pdf(pdf: bytes, owner_hwnd=0, printer="", ask=True, title="Labels", output=None):
+    """PDF über GDI drucken. ask=True: Windows-Druckdialog (Drucker, Eigenschaften, Exemplare).
+    Jede Seite wird in Druckerauflösung gerendert und formatfüllend, zentriert auf den bedruckbaren Bereich
+    gesetzt. Rückgabe: Name des verwendeten Druckers. Abbruch im Dialog -> PrintCancelled.
+    output: in Datei drucken (nur für Tests mit „Microsoft Print to PDF“)."""
+    import pypdfium2 as pdfium
+    k32, gdi, cdlg = _gdi()
+    pd = _PRINTDLGW(lStructSize=ctypes.sizeof(_PRINTDLGW), hwndOwner=owner_hwnd)
+    name, hdc = printer, None
+    if not ask and printer:  # ohne Dialog auf den gespeicherten Drucker
+        gdi.CreateDCW.argtypes, gdi.CreateDCW.restype = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_void_p,
+                                                         ctypes.c_void_p], ctypes.c_void_p
+        hdc = gdi.CreateDCW(None, printer, None, None)
+        if not hdc:
+            return print_pdf(pdf, owner_hwnd, printer, True, title, output)  # Drucker weg -> doch fragen
+    else:
+        # PD_RETURNDC | PD_NOSELECTION | PD_NOPAGENUMS | PD_USEDEVMODECOPIESANDCOLLATE
+        pd.Flags = 0x100 | 0x4 | 0x8 | 0x40000
+        if not ask:
+            pd.Flags |= 0x400  # PD_RETURNDEFAULT: Standarddrucker ohne Dialog
+        elif printer:
+            pd.hDevNames = _devnames(k32, printer)
+        if not cdlg.PrintDlgW(ctypes.byref(pd)):
+            err = cdlg.CommDlgExtendedError()
+            if err == 0x1008 and printer:  # PDERR_PRINTERNOTFOUND: gespeicherter Drucker existiert nicht mehr
+                return print_pdf(pdf, owner_hwnd, "", True, title, output)
+            if err:
+                raise RuntimeError(f"Druckdialog-Fehler {err:#x}")
+            raise PrintCancelled()
+        hdc = pd.hDC
+    try:
+        if pd.hDevNames:
+            p = k32.GlobalLock(pd.hDevNames)
+            name = ctypes.wstring_at(p + 2 * ctypes.c_uint16.from_address(p + 2).value)
+            k32.GlobalUnlock(pd.hDevNames)
+        if not hdc:
+            raise RuntimeError("Der Drucker konnte nicht geöffnet werden.")
+        try:
+            hres, vres = gdi.GetDeviceCaps(hdc, 8), gdi.GetDeviceCaps(hdc, 10)   # HORZRES/VERTRES (bedruckbar)
+            dpi_x, dpi_y = gdi.GetDeviceCaps(hdc, 88), gdi.GetDeviceCaps(hdc, 90)
+            doc_name = ctypes.create_unicode_buffer(title)
+
+            class DOCINFOW(ctypes.Structure):
+                _fields_ = [("cbSize", ctypes.c_int), ("lpszDocName", ctypes.c_wchar_p), ("lpszOutput", ctypes.c_wchar_p),
+                            ("lpszDatatype", ctypes.c_wchar_p), ("fwType", ctypes.c_uint32)]
+
+            class BITMAPINFOHEADER(ctypes.Structure):
+                _fields_ = [("biSize", ctypes.c_uint32), ("biWidth", ctypes.c_int32), ("biHeight", ctypes.c_int32),
+                            ("biPlanes", ctypes.c_uint16), ("biBitCount", ctypes.c_uint16),
+                            ("biCompression", ctypes.c_uint32), ("biSizeImage", ctypes.c_uint32),
+                            ("biXPelsPerMeter", ctypes.c_int32), ("biYPelsPerMeter", ctypes.c_int32),
+                            ("biClrUsed", ctypes.c_uint32), ("biClrImportant", ctypes.c_uint32)]
+
+            di = DOCINFOW(ctypes.sizeof(DOCINFOW), doc_name.value, output, None, 0)
+            if gdi.StartDocW(hdc, ctypes.byref(di)) <= 0:
+                raise RuntimeError("Druckauftrag konnte nicht gestartet werden.")
+            doc = pdfium.PdfDocument(pdf)
+            try:
+                for page in doc:
+                    w_pt, h_pt = page.get_size()
+                    # Pixel je Punkt so wählen, dass die Seite den bedruckbaren Bereich ausfüllt (Seitenverhältnis
+                    # bleibt); bei ungleicher Auflösung X/Y streckt StretchDIBits die Höhe passend
+                    s = min(hres / w_pt, vres / h_pt * dpi_x / dpi_y)
+                    bm = page.render(scale=s, prefer_bgrx=True)
+                    bw, bh = bm.width, bm.height
+                    dw, dh = bw, round(bh * dpi_y / dpi_x)
+                    bih = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), bw, -bh, 1, 32, 0, 0, 0, 0, 0, 0)
+                    gdi.StartPage(hdc)
+                    gdi.StretchDIBits(hdc, (hres - dw) // 2, (vres - dh) // 2, dw, dh, 0, 0, bw, bh,
+                                      ctypes.cast(bm.buffer, ctypes.c_void_p), ctypes.byref(bih), 0, 0x00CC0020)
+                    gdi.EndPage(hdc)
+                    bm.close()
+                    page.close()
+            finally:
+                doc.close()
+            gdi.EndDoc(hdc)
+        finally:
+            gdi.DeleteDC(hdc)
+    finally:
+        for h in (pd.hDevMode, pd.hDevNames):
+            if h:
+                k32.GlobalFree(h)
+    return name
 
 
 A6_PT = (297.64, 419.53)  # 105 × 148 mm
@@ -2654,7 +2788,7 @@ class App(tk.Tk):
         dlg = PrintDialog(self, with_label, self.cfg["label_paper"])
         if not dlg.result:
             return
-        orders, paper = dlg.result
+        orders, paper, action = dlg.result
         orders = sorted(orders, key=lambda o: o.pick or float("inf"))  # in der Reihenfolge des Anhakens
         self.cfg["label_paper"] = paper
         self.cfg.save()
@@ -2682,12 +2816,12 @@ class App(tk.Tk):
                         raise RuntimeError("Für A4 werden Sendcloud-Paket-IDs benötigt (keine vorhanden).")
                     parts = [sc.labels_bulk(ids[k:k + 20], "A4") for k in range(0, len(ids), 20)]
                 pages = merge_pdfs(parts, target)
-                self.q.put(("printjob", (orders, target, pages, None)))
+                self.q.put(("printjob", (orders, target, pages, None, paper, action)))
             except Exception as e:
-                self.q.put(("printjob", (orders, None, 0, e)))
+                self.q.put(("printjob", (orders, None, 0, e, paper, action)))
         threading.Thread(target=run, daemon=True).start()
 
-    def _print_finished(self, orders, target, pages, error):
+    def _print_finished(self, orders, target, pages, error, paper="A6", action="pdf"):
         self.busy = False
         self.progress.stop()
         self.progress.configure(mode="determinate", value=0)
@@ -2695,14 +2829,30 @@ class App(tk.Tk):
             messagebox.showerror(APP_NAME, f"Sammeldruck fehlgeschlagen:\n{error}")
             self._update_status()
             return
-        printed = False
-        if self.cfg["print_direct"] == "1":
+        printed = ""
+        if action == "print":
+            key = f"printer_{paper.lower()}"  # eigener Drucker je Format: A6 Etiketten, A4 Büro
+            self.busy = True  # während des Dialogs keinen Hintergrund-Abgleich einarbeiten
+            self.configure(cursor="watch")
+            self.update()
             try:
-                os.startfile(target, "print")
-                printed = True
-            except OSError:
-                pass
-        if not printed:
+                printed = print_pdf(open(target, "rb").read(), int(self.wm_frame(), 16), self.cfg[key],
+                                    ask=self.cfg["print_direct"] != "1", title=os.path.basename(target))
+                self.cfg[key] = printed
+                self.cfg.save()
+            except PrintCancelled:
+                self._update_status("Druck abgebrochen – Labels bleiben als ungedruckt markiert.")
+                return
+            except ImportError:
+                action = "pdf"  # Druckmodul fehlt (Entwicklungsumgebung) – wie bisher PDF öffnen
+            except Exception as e:
+                if not messagebox.askyesno(APP_NAME, f"Drucken fehlgeschlagen:\n{e}\n\nStattdessen das PDF öffnen?"):
+                    return
+                action = "pdf"
+            finally:
+                self.busy = False
+                self.configure(cursor="")
+        if action == "pdf":
             os.startfile(target)
         stamp = dt.datetime.now().strftime("%d.%m. %H:%M")
         for o in orders:
@@ -2712,7 +2862,7 @@ class App(tk.Tk):
         self.save_session()
         removed = self._cleanup_finished()
         self._update_status(f"Sammeldruck: {len(orders)} Aufträge, {pages} Seite(n) – "
-                            + ("an Standarddrucker gesendet." if printed else "PDF geöffnet, bitte drucken (Strg+P).")
+                            + (f"an {printed} gesendet." if printed else "PDF geöffnet, bitte drucken (Strg+P).")
                             + (f" {len(removed)} erledigte Aufträge entfernt." if removed else ""))
 
     def export(self):
@@ -3046,20 +3196,21 @@ class PrintDialog(tk.Toplevel):
                         variable=self.paper).grid(row=r + 2, column=0, sticky="w")
         b = ttk.Frame(f)
         b.grid(row=r + 3, column=0, sticky="e", pady=(14, 0))
-        ttk.Button(b, text="Sammel-PDF erstellen", command=self.ok).pack(side="left")
+        ttk.Button(b, text="Drucken…", command=lambda: self.ok("print")).pack(side="left")
+        ttk.Button(b, text="Als PDF öffnen", command=lambda: self.ok("pdf")).pack(side="left", padx=(6, 0))
         ttk.Button(b, text="Abbrechen", command=self.destroy).pack(side="left", padx=(6, 0))
         self.bind("<Escape>", lambda e: self.destroy())
         self.grab_set()
         self.wait_window()
 
-    def ok(self):
+    def ok(self, action="print"):
         if self.choice.get() < 0:
             messagebox.showinfo(APP_NAME, "Bitte auswählen, welche Labels gedruckt werden sollen.", parent=self)
             return
         lst = self.choices[self.choice.get()][1]
         if not lst:
             return
-        self.result = (lst, self.paper.get())
+        self.result = (lst, self.paper.get(), action)
         self.destroy()
 
 
@@ -3166,7 +3317,7 @@ class SettingsDialog(tk.Toplevel):
             row=r + 1, column=1, sticky="w", padx=(8, 0), pady=(2, 0))
         r += 2
         self.print_direct = tk.BooleanVar(value=cfg["print_direct"] == "1")
-        ttk.Checkbutton(f, text="Sammeldruck direkt an Standarddrucker senden (sonst PDF öffnen)",
+        ttk.Checkbutton(f, text="Ohne Druckdialog direkt auf den zuletzt gewählten Drucker drucken",
                         variable=self.print_direct).grid(row=r, column=0, columnspan=2, sticky="w", pady=(8, 0))
         r += 1
         ttk.Label(f, text="Gemeinsamer Ordner", font=F["section"]).grid(row=r, column=0, sticky="w", pady=(14, 0))
