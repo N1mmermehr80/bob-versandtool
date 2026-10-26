@@ -659,6 +659,7 @@ class S4TError(Exception):
 
 
 S4T_PATH = "/services/ecs-ws.ecs-wsHttpsSoap11Endpoint/"
+S4T_INTERVAL_MS = 5 * 60 * 1000  # automatischer Abgleich im Hintergrund
 S4T_NS = "http://webservice.web.speed4trade.com"
 S4T_PARAM = {"updateOrderStatus": "argRequestData"}  # alle anderen Methoden: requestData (siehe WSDL)
 
@@ -911,6 +912,7 @@ class FolderBackend:
         for d in self.dirs.values():
             os.makedirs(d, exist_ok=True)
         self.mutex = threading.Lock()
+        self._cache = {}  # Pfad -> ((mtime_ns, Größe), Inhalt)
 
     @staticmethod
     def _safe(ref):
@@ -983,25 +985,41 @@ class FolderBackend:
                 sig += [(e.name, e.stat().st_mtime_ns, e.stat().st_size) for e in it if e.name.endswith(".json")]
         return hash(tuple(sorted(sig)))
 
+    def _read_many(self, kind):
+        """Alle JSON-Dateien eines Unterordners lesen. Auf Netzlaufwerken dauert jedes Öffnen ~0,3 s (Latenz),
+        daher parallel und nur geänderte Dateien (Größe/Änderungszeit) erneut lesen."""
+        from concurrent.futures import ThreadPoolExecutor
+        with os.scandir(self.dirs[kind]) as it:
+            entries = [(e.name, e.path, e.stat()) for e in it if e.name.endswith(".json")]
+        cache, result, todo = self._cache, {}, []
+        for name, path, st in entries:
+            hit = cache.get(path)
+            if hit and hit[0] == (st.st_mtime_ns, st.st_size):
+                result[name] = hit[1]
+            else:
+                todo.append((name, path, (st.st_mtime_ns, st.st_size)))
+        if todo:
+            with ThreadPoolExecutor(min(32, len(todo))) as ex:
+                for (name, path, stamp), data in zip(todo, ex.map(lambda t: self._read(t[1]), todo)):
+                    result[name] = data
+                    if data is not None:
+                        cache[path] = (stamp, data)
+        return result
+
     def load_all(self):
         orders = {}
-        with os.scandir(self.dirs["auftraege"]) as it:
-            for e in it:
-                if e.name.endswith(".json"):
-                    rec = self._read(e.path)
-                    # Konfliktkopien von Sync-Diensten (z. B. „17588-PC01.json“) ignorieren
-                    if not rec or self._safe(rec.get("ref", "")) + ".json" != e.name:
-                        continue
-                    if rec["ref"] not in orders or rec["version"] > orders[rec["ref"]]["version"]:
-                        orders[rec["ref"]] = rec
+        for name, rec in self._read_many("auftraege").items():
+            # Konfliktkopien von Sync-Diensten (z. B. „17588-PC01.json“) ignorieren
+            if not rec or self._safe(rec.get("ref", "")) + ".json" != name:
+                continue
+            if rec["ref"] not in orders or rec["version"] > orders[rec["ref"]]["version"]:
+                orders[rec["ref"]] = rec
         orders = list(orders.values())
         orders.sort(key=lambda r: r.get("created", ""))
         hidden = {"deleted": {}, "completed": {}}
-        with os.scandir(self.dirs["ausgeblendet"]) as it:
-            for e in it:
-                if e.name.endswith(".json"):
-                    h = self._read(e.path) or {}
-                    hidden.setdefault(h.get("kind", "deleted"), {})[h.get("ref", e.name[:-5])] = h.get("at", "")
+        for name, h in self._read_many("ausgeblendet").items():
+            h = h or {}
+            hidden.setdefault(h.get("kind", "deleted"), {})[h.get("ref", name[:-5])] = h.get("at", "")
         return orders, hidden
 
     # ----- Schreiben
@@ -1214,6 +1232,8 @@ class App(tk.Tk):
         if BACKEND is not None:
             self.after(3000, self._sync_tick)
         self.after(5000, self._update_tick)
+        self._s4t_running = False
+        self.after(3000, self._s4t_tick)
         if not self.cfg.public_key:
             self.after(300, lambda: (messagebox.showinfo(APP_NAME, "Bitte zuerst die Sendcloud-Zugangsdaten in den "
                                                                     "Einstellungen hinterlegen."), self.settings()))
@@ -1725,12 +1745,69 @@ class App(tk.Tk):
                                 + (f" mit dem Kennzeichen „{tag}“." if tag else "."))
             return
         self._add_orders(result, "Speed4Trade", "Abholung aus Speed4Trade")
+        removed = self._prune_s4t({o.ref for o in result})
+        if removed:
+            self._update_status(f"{removed} Aufträge entfernt, die in Speed4Trade nicht mehr offen sind.")
 
-    def _add_orders(self, new, source, title):
-        """Neue Aufträge der Liste hinzufügen (CSV-Import oder Speed4Trade)."""
+    def _s4t_tick(self):
+        """Beim Start und danach alle 5 Minuten offene Aufträge aus Speed4Trade im Hintergrund abgleichen."""
+        if self.cfg.s4t_ready and not self.busy and not self._s4t_running:
+            self._s4t_running = True
+
+            def run():
+                try:
+                    self.q.put(("s4t_auto", S4T(self.cfg).fetch_orders(_num(self.cfg["default_weight_kg"]) or 2.01)))
+                except Exception as e:
+                    self.q.put(("s4t_auto", e))
+            threading.Thread(target=run, daemon=True).start()
+        self.after(S4T_INTERVAL_MS, self._s4t_tick)
+
+    def _s4t_auto(self, result):
+        self._s4t_running = False
+        when = dt.datetime.now().strftime("%H:%M")
+        if isinstance(result, Exception):
+            self._update_status(f"Speed4Trade-Abgleich {when} fehlgeschlagen: {result}")
+            return
+        if self.busy:
+            return  # während Senden/Drucken nichts umbauen – nächster Durchlauf in 5 Minuten
+        added = self._add_orders(result, "Speed4Trade", "Speed4Trade-Abgleich", quiet=True)
+        removed = self._prune_s4t({o.ref for o in result})
+        self._update_status(f"Speed4Trade abgeglichen {when}: {added} neu, {removed} entfernt, "
+                            f"{len(result)} offen.")
+
+    def _prune_s4t(self, open_refs):
+        """Aufträge aus Speed4Trade, die dort nicht mehr offen sind (z. B. von Hand versendet oder storniert) und
+        hier noch unbearbeitet sind, aus der Liste nehmen. Begonnene oder versendete Aufträge bleiben stehen."""
+        stale = [o for o in self.orders if o.s4t_id and o.ref not in open_refs and o.status == "neu"
+                 and not o.tracking and not o.selected and not o.busy_elsewhere]
+        if not stale:
+            return 0
+        stamp = dt.datetime.now().isoformat(timespec="seconds")
+        removed = []
+        for o in stale:
+            if BACKEND is not None:
+                try:
+                    BACKEND.hide(o.ref, "completed")
+                except (OSError, Conflict):
+                    continue
+            self.completed[o.ref] = stamp
+            self._synced.pop(o.ref, None)
+            append_log(o, "in Speed4Trade nicht mehr offen, aus Liste entfernt")
+            removed.append(o)
+        self.orders = [o for o in self.orders if o not in removed]
+        self.tree.delete(*self.tree.get_children())
+        self.refresh()
+        self.save_session()
+        return len(removed)
+
+    def _add_orders(self, new, source, title, quiet=False):
+        """Neue Aufträge der Liste hinzufügen (CSV-Import oder Speed4Trade). quiet: automatischer Abgleich im
+        Hintergrund – keine Rückfragen und Meldefenster, nur Statuszeile."""
         # Früher gelöschte Aufträge nicht ungefragt wieder aufnehmen
         hidden = [o.ref for o in new if o.ref in self.deleted]
-        if hidden:
+        if hidden and quiet:
+            new = [o for o in new if o.ref not in self.deleted]
+        elif hidden:
             if messagebox.askyesno(APP_NAME, f"{len(hidden)} dieser Aufträge wurden früher aus der Liste "
                                              "gelöscht:\n" + ", ".join(hidden[:25]) +
                                    "\n\nWieder anzeigen? (Nein = weiterhin ausblenden)"):
@@ -1741,7 +1818,12 @@ class App(tk.Tk):
             else:
                 new = [o for o in new if o.ref not in self.deleted]
         if BACKEND is not None:
-            return self._import_shared(source, new, title)
+            return self._import_shared(source, new, title, quiet)
+        existing = {o.ref for o in self.orders}
+        if quiet and all(o.ref in existing or o.ref in self.completed for o in new):
+            if self._link_s4t(new):
+                self.save_session()
+            return 0
         # Erledigte Aufträge (Label gedruckt + Sendungsnummer exportiert) aus der Liste nehmen
         finished = self._cleanup_finished(refresh=False)
         # Neue Aufträge HINZUFÜGEN: vorhandene behalten ihren Stand, erledigte kommen nicht wieder
@@ -1764,8 +1846,10 @@ class App(tk.Tk):
             parts.append(f"{len(skipped_done)} schon erledigt (übersprungen)")
         if finished:
             parts.append(f"{len(finished)} erledigte entfernt")
-        self._update_status(", ".join(parts) + ".")
-        messagebox.showinfo(APP_NAME, f"{title}:\n\n• " + "\n• ".join(parts))
+        self._update_status(f"{title}: " + ", ".join(parts) + ".")
+        if not quiet:
+            messagebox.showinfo(APP_NAME, f"{title}:\n\n• " + "\n• ".join(parts))
+        return len(added)
 
     def _link_s4t(self, new):
         """Aufträge, die schon aus einer CSV in der Liste stehen, mit Speed4Trade verknüpfen (für die Rückmeldung)."""
@@ -1803,24 +1887,35 @@ class App(tk.Tk):
             self.save_session()
         return removed
 
-    def _import_shared(self, source, new, title):
-        """Import in den gemeinsamen Ordner: nur hinzufügen; Erledigte werden für alle entfernt."""
+    def _import_shared(self, source, new, title, quiet=False):
+        """Import in den gemeinsamen Ordner: nur hinzufügen; Erledigte werden für alle entfernt.
+        Bekannte Aufträge werden lokal aussortiert – jeder Zugriff auf ein Netzlaufwerk kostet spürbar Zeit."""
+        known = {o.ref for o in self.orders}
+        res = {"added": 0, "already": sum(o.ref in known for o in new),
+               "completed": sum(o.ref in self.completed and o.ref not in known for o in new), "deleted": 0}
+        fresh = [o for o in new if o.ref not in known and o.ref not in self.completed]
+        if quiet and not fresh:
+            if self._link_s4t(new):
+                self.save_session()
+            return 0
         self._push()
-        res = {"added": 0, "already": 0, "completed": 0, "deleted": 0}
         try:
             finished = self._cleanup_finished(refresh=False)
             if self.cfg["use_history"] == "1":  # Erfahrungswerte vor dem Teilen anwenden
                 try:
                     cache = json.load(open(HISTORY_PATH, encoding="utf-8"))
-                    apply_history(new, cache.get("data", {}), _num(self.cfg["default_weight_kg"]) or 2.01)
+                    apply_history(fresh, cache.get("data", {}), _num(self.cfg["default_weight_kg"]) or 2.01)
                 except Exception:
                     pass
-            for o in new:
+            for o in fresh:
                 res[BACKEND.add(shared_data(o))] += 1
             records, hidden = BACKEND.load_all()
         except (OSError, Conflict) as e:
-            messagebox.showerror(APP_NAME, f"Import in den gemeinsamen Ordner fehlgeschlagen:\n{e}")
-            return
+            if quiet:
+                self._update_status(f"{title}: gemeinsamer Ordner nicht erreichbar ({e}).")
+            else:
+                messagebox.showerror(APP_NAME, f"Import in den gemeinsamen Ordner fehlgeschlagen:\n{e}")
+            return 0
         self.source = source
         self._sig = None
         self.tree.delete(*self.tree.get_children())
@@ -1838,8 +1933,10 @@ class App(tk.Tk):
             parts.append(f"{res['deleted']} früher gelöscht (ausgeblendet)")
         if finished:
             parts.append(f"{len(finished)} erledigte entfernt")
-        self._update_status(", ".join(parts) + ".")
-        messagebox.showinfo(APP_NAME, f"{title} in die gemeinsame Liste:\n\n• " + "\n• ".join(parts))
+        self._update_status(f"{title}: " + ", ".join(parts) + ".")
+        if not quiet:
+            messagebox.showinfo(APP_NAME, f"{title} in die gemeinsame Liste:\n\n• " + "\n• ".join(parts))
+        return res["added"]
 
     # ----- Erfahrungswerte aus früheren Sendungen
     def _apply_history_cached(self):
@@ -2070,6 +2167,8 @@ class App(tk.Tk):
                     self._print_finished(*val)
                 elif kind == "s4t":
                     self._s4t_fetched(val)
+                elif kind == "s4t_auto":
+                    self._s4t_auto(val)
                 elif kind == "update":
                     self._show_update(*val)
                 elif kind == "update_progress":

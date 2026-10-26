@@ -52,6 +52,7 @@ Automatisch korrigierte Aufträge bleiben weiß, Details dazu stehen im Hinweisb
 Einrichten unter **Einstellungen → Speed4Trade-Anbindung…**: Server-Adresse, Webservice-Benutzer und Passwort. Liegt eine `.env` mit `S4T_IP`, `S4T_Benutzername` und `S4T_Passwort` neben der exe, werden die Werte beim ersten Start übernommen.
 
 - **Abholen:** alle Aufträge im eingestellten Status (Standard 130 = bezahlt, Versand offen). Optional lässt sich auf ein Auftragskennzeichen einschränken. Aufträge, die schon in der Liste stehen, bleiben unverändert.
+- **Automatischer Abgleich:** Beim Start und danach alle 5 Minuten holt das Tool im Hintergrund neue Aufträge, ohne Rückfrage. Aufträge, die in Speed4Trade nicht mehr offen sind (z. B. dort von Hand versendet oder storniert), verschwinden aus der Liste, sofern sie hier noch unbearbeitet sind. Angehakte, gesendete oder gerade gesendete Aufträge bleiben stehen. Das Ergebnis steht in der Statuszeile. Während Senden oder Drucken läuft, wartet der Abgleich auf den nächsten Durchlauf.
 - **Rückmeldung:** Nach dem Senden meldet das Tool den Versand mit Sendungsnummer (DHL) an Speed4Trade. Speed4Trade setzt den Auftrag dann auf „versendet“, beim nächsten Abholen kommt er nicht wieder. Gemeldete Aufträge gelten als exportiert, ein CSV-Export ist für sie nicht mehr nötig.
 - **Fehler bei der Rückmeldung:** Das Label bleibt gültig. Der Auftrag zeigt den Fehler in den Hinweisen, die Meldung lässt sich per **Rechtsklick → An Speed4Trade als versendet melden…** nachholen. Darüber lassen sich auch manuell versendete Aufträge mit Sendungsnummer melden.
 - **Gewicht:** Speed4Trade liefert in den Aufträgen kein Gewicht. Es gelten die Regeln unten (Erfahrungswerte, Radsatz-Regel, sonst 2,01 kg).
@@ -80,6 +81,8 @@ Ohne Server und ohne Adminrechte: Die Liste liegt in einem **Netzwerkordner**, a
 - Sendcloud-Zugangsdaten
 - Absender und weitere Einstellungen
 - die eigene Auswahl (Häkchen)
+
+**Netzlaufwerk:** Auf Netzlaufwerken (z. B. `U:\…`) dauert jedes Öffnen einer Datei spürbar (~0,3 s). Das Tool liest deshalb parallel und beim Abgleich nur geänderte Dateien. Bekannte Aufträge werden beim Abholen gar nicht erst in den Ordner geschrieben.
 
 ## Automatische Korrekturen
 
