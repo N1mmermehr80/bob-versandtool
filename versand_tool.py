@@ -1297,6 +1297,12 @@ def _download(info, path, progress=None):
         raise RuntimeError("Prüfsumme stimmt nicht – Update verworfen.")
 
 
+def _lp(path):
+    """Pfad mit \\\\?\\-Präfix: erlaubt mehr als 260 Zeichen (Bibliotheken im Paket haben tiefe Unterordner)."""
+    path = os.path.abspath(path)
+    return path if path.startswith("\\\\?\\") else "\\\\?\\" + path
+
+
 def install_update(info, progress=None):
     """Update laden. exe (alte Variante): laufende exe umbenennen und ersetzen, Rückgabe der exe.
     zip (Ordner-Variante): nach <Programmordner>\\_update\\neu entpacken, Rückgabe der neuen exe dort –
@@ -1307,7 +1313,7 @@ def install_update(info, progress=None):
         raise RuntimeError("Updates funktionieren nur in der exe-Version.")
     exe = sys.executable
     if info.get("kind") == "zip":
-        stage = os.path.join(os.path.dirname(exe), "_update")
+        stage = _lp(os.path.join(os.path.dirname(exe), "_update"))
         shutil.rmtree(stage, ignore_errors=True)
         new_dir = os.path.join(stage, "neu")
         os.makedirs(new_dir)
@@ -1320,7 +1326,7 @@ def install_update(info, progress=None):
                     raise RuntimeError(f"Ungültiger Pfad im Update-Paket: {name}")
             z.extractall(new_dir)
         os.remove(pkg)
-        new_exe = os.path.join(new_dir, UPDATE_ASSET)
+        new_exe = os.path.join(new_dir[4:], UPDATE_ASSET)  # ohne \\?\ – wird als normaler Programmpfad gestartet
         internal = os.path.join(new_dir, "_internal")
         if not (os.path.isfile(new_exe) and os.path.isdir(internal)
                 and any(re.fullmatch(r"python3\d+\.dll", f, re.I) for f in os.listdir(internal))):
@@ -1359,8 +1365,9 @@ def run_installer(target, pid):
     if h:
         k32.WaitForSingleObject(h, 60000)
         k32.CloseHandle(h)
-    src = os.path.dirname(sys.executable)
-    t_exe, t_int = os.path.join(target, UPDATE_ASSET), os.path.join(target, "_internal")
+    src = _lp(os.path.dirname(sys.executable))
+    start_exe = os.path.join(os.path.abspath(target), UPDATE_ASSET)
+    t_exe, t_int = _lp(start_exe), _lp(os.path.join(target, "_internal"))
     env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")
     moved, created = [], []
     try:
@@ -1394,9 +1401,9 @@ def run_installer(target, pid):
         ctypes.windll.user32.MessageBoxW(None, f"Update konnte nicht installiert werden:\n{e}\n\n"
                                                "Die bisherige Version wird wieder gestartet.", APP_NAME, 0x10)
         if os.path.exists(t_exe):
-            subprocess.Popen([t_exe], cwd=target, env=env, close_fds=True)
+            subprocess.Popen([start_exe], cwd=target, env=env, close_fds=True)
         return 1
-    subprocess.Popen([t_exe], cwd=target, env=env, close_fds=True)
+    subprocess.Popen([start_exe], cwd=target, env=env, close_fds=True)
     return 0
 
 
@@ -1414,7 +1421,7 @@ def cleanup_old_update():
         except OSError:
             pass
     for d in ("_internal.alt", "_update"):
-        shutil.rmtree(os.path.join(base, d), ignore_errors=True)
+        shutil.rmtree(_lp(os.path.join(base, d)), ignore_errors=True)
 
 
 BACKEND = None  # wird gesetzt, wenn ein gemeinsamer Ordner eingestellt ist
