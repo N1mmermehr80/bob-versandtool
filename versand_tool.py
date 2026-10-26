@@ -201,6 +201,7 @@ class Order:
         self.weight_source = ""      # "Export", "Historie", "Standard", "manuell"
         self.hints = []
         self.selected = False
+        self.pick = 0                # Reihenfolge des Anhakens (Senden und Sammeldruck), nur lokal
         self.status = "neu"
         self.tracking = ""
         self.parcel_id = ""
@@ -666,7 +667,7 @@ def merge_pdfs(parts, target):
 
 # --------------------------------------------------------------------------- Gemeinsamer Ordner (mehrere Arbeitsplätze)
 
-LOCAL_ONLY = ("selected", "version", "updated_by", "updated_at", "local_msg")  # wird nicht geteilt
+LOCAL_ONLY = ("selected", "pick", "version", "updated_by", "updated_at", "local_msg")  # wird nicht geteilt
 LOCK_TIMEOUT = 15 * 60  # Reservierung „wird gesendet“ verfällt nach 15 min (z. B. Absturz)
 
 
@@ -1286,17 +1287,26 @@ class App(tk.Tk):
                                           + (f", {o.tracking}" if o.tracking else "") + ").")
             return
         o.selected = not o.selected
+        o.pick = self._next_pick() if o.selected else 0
         self._update_row(int(iid))
         self._update_status()
         self.save_session()
+
+    def _next_pick(self):
+        return max((o.pick for o in self.orders), default=0) + 1
 
     def select_all(self, on):
         if self.busy:
             return
         visible = [o for o in self.orders if self._visible(o)]  # bei aktiver Suche nur die angezeigten
         for o in visible:
+            was = o.selected
             o.selected = on and not o.done and not o.tracking and not o.validate() and not o.needs_review \
                 and not o.busy_elsewhere
+            if o.selected and not was:
+                o.pick = self._next_pick()
+            elif not o.selected and not o.done:
+                o.pick = 0
         self.refresh()
         self.save_session()
         skipped = [o.ref for o in visible if on and o.needs_review and not o.done]
@@ -1562,7 +1572,8 @@ class App(tk.Tk):
     def send_selected(self):
         if self.busy:
             return
-        sel = [o for o in self.orders if o.selected and not o.tracking and not o.busy_elsewhere]
+        sel = sorted((o for o in self.orders if o.selected and not o.tracking and not o.busy_elsewhere),
+                     key=lambda o: o.pick or float("inf"))
         if not sel:
             messagebox.showinfo(APP_NAME, "Keine Aufträge ausgewählt (Häkchen in der ersten Spalte).")
             return
@@ -1704,7 +1715,8 @@ class App(tk.Tk):
                 elif kind == "update_progress":
                     self.update_text.configure(text=f"Update wird geladen … {val:.0%}")
                 elif kind == "update_done":
-                    self._update_finished(*val)
+                    if self._update_finished(*val):
+                        return  # Fenster ist zu, kein weiteres after()
                 elif kind == "history":
                     data, notify = val
                     self.busy = False
@@ -1822,8 +1834,12 @@ class App(tk.Tk):
             return
         import subprocess
         self.save_session()
-        subprocess.Popen([exe], close_fds=True)
+        # Ohne Reset übernimmt die neue exe den Entpackordner der alten (PyInstaller-onefile) – mit alten
+        # Modulen, und er wird beim Beenden gelöscht. Dann hängt der Neustart.
+        env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")
+        subprocess.Popen([exe], close_fds=True, env=env)
         self.destroy()
+        return True
 
     def _on_close(self):
         if self.busy and not messagebox.askyesno(
@@ -1909,7 +1925,7 @@ class App(tk.Tk):
         tmp = Order.from_dict({**rec["data"], "version": rec["version"], "updated_by": rec.get("updated_by", ""),
                                "updated_at": rec.get("updated_at", "")}, keep_lock=keep_lock)
         for k, v in tmp.__dict__.items():
-            if k != "selected":
+            if k not in ("selected", "pick"):
                 setattr(o, k, v)
         self._synced[o.ref] = json.dumps({k: v for k, v in rec["data"].items() if k not in LOCAL_ONLY},
                                          sort_keys=True, ensure_ascii=False)
@@ -1941,11 +1957,13 @@ class App(tk.Tk):
         if local:
             self.source = local.get("source", "")
         sel = {x["ref"] for x in (local or {}).get("orders", []) if x.get("selected")}
+        picks = {x["ref"]: x.get("pick", 0) for x in (local or {}).get("orders", [])}
         self.orders = []
         for rec in records:
             o = Order(rec["ref"])
             self._adopt(o, rec)
             o.selected = o.ref in sel and not o.done
+            o.pick = picks.get(o.ref, 0)
             self.orders.append(o)
         self.deleted, self.completed = hidden.get("deleted", {}), hidden.get("completed", {})
         self._sig = None
@@ -2172,6 +2190,7 @@ class App(tk.Tk):
         if not dlg.result:
             return
         orders, paper = dlg.result
+        orders = sorted(orders, key=lambda o: o.pick or float("inf"))  # in der Reihenfolge des Anhakens
         self.cfg["label_paper"] = paper
         self.cfg.save()
         self.busy = True

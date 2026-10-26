@@ -12,6 +12,7 @@ Liest den S4T-Versandexport (`GLS_*.csv`, versendet wird mit DHL), legt ausgewä
 4. **🚚 Senden:** Ausgewählte Aufträge an Sendcloud senden. Die Sendungen werden bei DHL angemeldet, die Labels liegen danach zum Drucken im Sendcloud-Panel.
 5. **🖨 Labels drucken:** Die Label-PDFs werden beim Senden automatisch ins Programm geladen. Hier lassen sie sich zu einem Sammel-PDF zusammenfassen:
    - Auswahl: alle ungedruckten, nur angehakte oder die markierte Zeile
+   - Reihenfolge im Sammel-PDF: so, wie die Aufträge vor dem Senden angehakt wurden (auch über mehrere Sendevorgänge). Aufträge ohne Häkchen-Reihenfolge, z. B. von Kollegen gesendet, kommen danach in Listenreihenfolge.
    - Format: A6 für den Etikettendrucker oder A4 für den Bürodrucker (mehrere Labels pro Seite)
    - Sendcloud liefert DHL-Labels in einem Sonderformat (~69 × 140 mm). Das Tool setzt sie automatisch formatfüllend auf echtes A6 (105 × 148 mm).
 6. **💾 Exportieren:** Sendungsnummern als CSV (`Auftragsnummer;Sendungsnummer`) speichern.
