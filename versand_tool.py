@@ -10,17 +10,22 @@ import csv
 import ctypes
 import ctypes.wintypes
 import datetime as dt
+import hashlib
+import http.client
 import io
 import json
 import os
 import queue
 import re
+import ssl
 import sys
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape as xml_escape
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -68,12 +73,21 @@ DEFAULTS = {
     "print_direct": "0",
     "save_label_pdf": "0",
     "label_dir": "",
+    # Speed4Trade CONNECT (Webservice) – ebenfalls firmenspezifisch, daher leer
+    "s4t_host": "",            # Adresse des Servers, z. B. IP
+    "s4t_user": "",
+    "s4t_cert_sha256": "",     # Fingerabdruck des bestätigten Server-Zertifikats
+    "s4t_tag": "",             # optional: nur Aufträge mit diesem Auftragskennzeichen (leer = alle im Status)
+    "s4t_status_id": "130",    # paid shipping
+    "s4t_mandator": "1",
+    "s4t_report": "1",         # Versand mit Sendungsnummer an S4T zurückmelden
 }
 
 # Diese Einstellungen gelten für alle Arbeitsplätze (im gemeinsamen Ordner); Zugangsdaten bleiben pro PC.
 SHARED_SETTINGS = ("default_weight_kg", "shipping_option_de", "shipping_option_eu", "contract_id", "brand_id",
                    "sender_name", "sender_company", "sender_email", "sender_phone", "sender_street",
-                   "sender_house_number", "sender_postal_code", "sender_city", "sender_country", "use_history")
+                   "sender_house_number", "sender_postal_code", "sender_city", "sender_country", "use_history",
+                   "s4t_host", "s4t_cert_sha256", "s4t_tag", "s4t_status_id", "s4t_mandator", "s4t_report")
 REQUIRED_SENDER = (("sender_company", "Absender Firma"), ("sender_street", "Absender Straße"),
                    ("sender_house_number", "Absender Hausnr."), ("sender_postal_code", "Absender PLZ"),
                    ("sender_city", "Absender Ort"), ("sender_country", "Absender Land"),
@@ -122,11 +136,11 @@ class Config:
             self.cp["settings"] = {}
         for k, v in DEFAULTS.items():
             self.cp["settings"].setdefault(k, v)
-        if not self.public_key:
+        if not self.public_key or not self["s4t_user"]:
             self._import_env()
 
     def _import_env(self):
-        """Beim ersten Start Schlüssel aus einer .env neben dem Programm übernehmen."""
+        """Beim ersten Start Zugangsdaten aus einer .env neben dem Programm übernehmen."""
         base = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
         for p in (os.path.join(base, ".env"), os.path.join(base, "..", ".env"), os.path.join(os.getcwd(), ".env")):
             if os.path.isfile(p):
@@ -135,8 +149,17 @@ class Config:
                     if "=" in line:
                         k, v = line.split("=", 1)
                         env[k.strip()] = v.strip().strip("\"'")
-                if env.get("SENDCLOUD_PUBLIC_KEY") and env.get("SENDCLOUD_SECRET_KEY"):
+                changed = False
+                if not self.public_key and env.get("SENDCLOUD_PUBLIC_KEY") and env.get("SENDCLOUD_SECRET_KEY"):
                     self.set_keys(env["SENDCLOUD_PUBLIC_KEY"], env["SENDCLOUD_SECRET_KEY"])
+                    changed = True
+                if not self["s4t_user"] and env.get("S4T_Benutzername") and env.get("S4T_Passwort"):
+                    self["s4t_user"] = env["S4T_Benutzername"]
+                    self.s4t_password = env["S4T_Passwort"]
+                    if env.get("S4T_IP") and not self["s4t_host"]:
+                        self["s4t_host"] = env["S4T_IP"]
+                    changed = True
+                if changed:
                     self.save()
                     return
 
@@ -157,6 +180,19 @@ class Config:
     def set_keys(self, pub, sec):
         self.cp["settings"]["public_key_enc"] = protect(pub.strip())
         self.cp["settings"]["secret_key_enc"] = protect(sec.strip())
+
+    @property
+    def s4t_password(self):
+        return unprotect(self.cp["settings"].get("s4t_password_enc", ""))
+
+    @s4t_password.setter
+    def s4t_password(self, pw):
+        self.cp["settings"]["s4t_password_enc"] = protect(pw)
+
+    @property
+    def s4t_ready(self):
+        return all(self[k].strip() for k in ("s4t_host", "s4t_user", "s4t_cert_sha256")) \
+            and bool(self.s4t_password)
 
     def save(self):
         os.makedirs(APP_DIR, exist_ok=True)
@@ -216,6 +252,10 @@ class Order:
         self.updated_by = ""
         self.updated_at = ""
         self.local_msg = ""          # Hinweis nur für diesen Arbeitsplatz (nicht geteilt)
+        self.s4t_id = ""             # Auftrags-ID in Speed4Trade (nur bei Abholung über die API)
+        self.ebay = ""               # eBay-Bestellnummer
+        self.s4t_reported = ""       # Zeitpunkt der Versandmeldung an Speed4Trade
+        self.s4t_error = ""
 
     def to_dict(self):
         return dict(self.__dict__)
@@ -363,26 +403,7 @@ def read_export(path, default_weight):
             o.email = em
             if len(o.company) == 30:
                 o.hints.append("Firmenname evtl. abgeschnitten (30 Zeichen)")
-            # Hausnummer fehlt -> aus Zusatz oder Straße holen
-            if not o.house:
-                m = re.fullmatch(r"(.*?[A-Za-zÄÖÜäöüß.])\s*(\d+\s?[a-zA-Z]?(?:\s?-\s?\d+\s?[a-zA-Z]?)?)", o.street)
-                m2 = re.fullmatch(r"(.*?[A-Za-zÄÖÜäöüß.])\s*(\d+\s?[a-zA-Z]?)\b[\s,(/-]+(.+)", o.street)
-                if m:
-                    o.street, o.house = m.group(1).strip(" ,"), m.group(2).replace(" ", "")
-                    o.hints.append("Hausnummer aus Straße getrennt")
-                elif m2:
-                    rest = m2.group(3).strip(" ()")
-                    o.street, o.house = m2.group(1).strip(" ,"), m2.group(2).replace(" ", "")
-                    o.addr2 = (rest + " " + o.addr2).strip() if rest else o.addr2
-                    o.hints.append("Hausnummer und Zusatz aus Straße getrennt – bitte prüfen")
-                elif re.fullmatch(r"\d+\s?[a-zA-Z]?(\s?-\s?\d+\s?[a-zA-Z]?)?", o.addr2):
-                    o.house, o.addr2 = o.addr2, ""
-                    o.hints.append("Hausnummer aus Adresszusatz übernommen")
-                else:
-                    o.hints.append("Hausnummer fehlt")
-            if o.country == "DE" and re.fullmatch(r"\d{4}", o.zip):
-                o.zip = "0" + o.zip
-                o.hints.append("PLZ um führende 0 ergänzt")
+            _fix_address(o)
             ow = _num(g(r, "oweight"))
             order_weight[ref] = ow if ow and ow > 0 else None
         qty = _num(g(r, "qty")) or 1
@@ -395,22 +416,50 @@ def read_export(path, default_weight):
             o.items.append(item)
 
     for ref, o in orders.items():
-        if o.discounts:
-            o.hints.append(f"{len(o.discounts)} Rabatt-/Gutscheinzeile(n) nicht ins Paket übernommen")
-        valid = [i for i in o.items if i["weight"] and i["weight"] >= PLACEHOLDER_WEIGHT_KG]
-        total = sum(i["weight"] * i["qty"] for i in valid)
-        # ORDER WEIGHT ist die Summe der Artikelgewichte – fehlt eins, ist es zu niedrig
-        if o.items and len(valid) == len(o.items):
-            o.weight, o.weight_source = order_weight.get(ref) or round(total, 3), "Export"
-        else:
-            o.weight = max(order_weight.get(ref) or 0.0, round(total, 3), default_weight)
-            o.weight_source, o.weight_estimated = "Standard", True
-            part = f" ({len(o.items) - len(valid)} von {len(o.items)} Artikeln)" if valid else ""
-            o.hints.append(f"Gewicht nicht gepflegt{part}, {o.weight:.2f} kg angesetzt".replace(".", ","))
-            if len(o.items) == 1 and o.items[0]["qty"] == 1 and WHEELSET_RX.search(o.items[0]["name"]):
-                o.parcels, o.weight, o.weight_source = 4, 20.0, "Regel"
-                o.hints[-1] = "Radsatz erkannt: 4 Pakete à 20 kg angesetzt – bitte prüfen"
+        _set_weight(o, order_weight.get(ref), default_weight)
     return list(orders.values())
+
+
+def _fix_address(o):
+    """Hausnummer aus Straße/Zusatz trennen, deutsche PLZ mit führender 0 ergänzen."""
+    if not o.house:
+        m = re.fullmatch(r"(.*?[A-Za-zÄÖÜäöüß.])\s*(\d+\s?[a-zA-Z]?(?:\s?-\s?\d+\s?[a-zA-Z]?)?)", o.street)
+        m2 = re.fullmatch(r"(.*?[A-Za-zÄÖÜäöüß.])\s*(\d+\s?[a-zA-Z]?)\b[\s,(/-]+(.+)", o.street)
+        if m:
+            o.street, o.house = m.group(1).strip(" ,"), m.group(2).replace(" ", "")
+            o.hints.append("Hausnummer aus Straße getrennt")
+        elif m2:
+            rest = m2.group(3).strip(" ()")
+            o.street, o.house = m2.group(1).strip(" ,"), m2.group(2).replace(" ", "")
+            o.addr2 = (rest + " " + o.addr2).strip() if rest else o.addr2
+            o.hints.append("Hausnummer und Zusatz aus Straße getrennt – bitte prüfen")
+        elif re.fullmatch(r"\d+\s?[a-zA-Z]?(\s?-\s?\d+\s?[a-zA-Z]?)?", o.addr2):
+            o.house, o.addr2 = o.addr2, ""
+            o.hints.append("Hausnummer aus Adresszusatz übernommen")
+        else:
+            o.hints.append("Hausnummer fehlt")
+    if o.country == "DE" and re.fullmatch(r"\d{4}", o.zip):
+        o.zip = "0" + o.zip
+        o.hints.append("PLZ um führende 0 ergänzt")
+
+
+def _set_weight(o, order_weight, default_weight):
+    """Paketgewicht aus Artikelgewichten bzw. Auftragsgewicht, sonst Standardgewicht (oder Radsatz-Regel)."""
+    if o.discounts:
+        o.hints.append(f"{len(o.discounts)} Rabatt-/Gutscheinzeile(n) nicht ins Paket übernommen")
+    valid = [i for i in o.items if i["weight"] and i["weight"] >= PLACEHOLDER_WEIGHT_KG]
+    total = sum(i["weight"] * i["qty"] for i in valid)
+    # Auftragsgewicht ist die Summe der Artikelgewichte – fehlt eins, ist es zu niedrig
+    if o.items and len(valid) == len(o.items):
+        o.weight, o.weight_source = order_weight or round(total, 3), "Export"
+    else:
+        o.weight = max(order_weight or 0.0, round(total, 3), default_weight)
+        o.weight_source, o.weight_estimated = "Standard", True
+        part = f" ({len(o.items) - len(valid)} von {len(o.items)} Artikeln)" if valid else ""
+        o.hints.append(f"Gewicht nicht gepflegt{part}, {o.weight:.2f} kg angesetzt".replace(".", ","))
+        if len(o.items) == 1 and o.items[0]["qty"] == 1 and WHEELSET_RX.search(o.items[0]["name"]):
+            o.parcels, o.weight, o.weight_source = 4, 20.0, "Regel"
+            o.hints[-1] = "Radsatz erkannt: 4 Pakete à 20 kg angesetzt – bitte prüfen"
 
 
 def apply_history(orders, history, default_weight=2.01):
@@ -601,6 +650,160 @@ class Sendcloud:
         """Mehrere Labels in einem PDF (bei A4 mehrere Labels pro Seite), max. 20 je Aufruf."""
         q = urllib.parse.urlencode([("parcels", int(p)) for p in parcel_ids] + [("paper_size", paper)])
         return self._call("GET", "/parcel-documents/label?" + q, raw=True, accept="application/pdf")
+
+
+# --------------------------------------------------------------------------- Speed4Trade CONNECT
+
+class S4TError(Exception):
+    pass
+
+
+S4T_PATH = "/services/ecs-ws.ecs-wsHttpsSoap11Endpoint/"
+S4T_NS = "http://webservice.web.speed4trade.com"
+S4T_PARAM = {"updateOrderStatus": "argRequestData"}  # alle anderen Methoden: requestData (siehe WSDL)
+
+
+def s4t_fingerprint(host):
+    """SHA-256 des Server-Zertifikats. Wird ohne Zugangsdaten abgerufen und vom Benutzer bestätigt."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+    c = http.client.HTTPSConnection(host, 443, context=ctx, timeout=20)
+    try:
+        c.connect()
+        return hashlib.sha256(c.sock.getpeercert(binary_form=True)).hexdigest().upper()
+    finally:
+        c.close()
+
+
+class S4T:
+    """SOAP-Zugriff auf den Webservice. Das Server-Zertifikat ist selbst ausgestellt und lautet nicht auf die
+    Adresse, über die der Server erreichbar ist. Deshalb wird statt der üblichen Prüfung der bestätigte
+    Fingerabdruck verglichen – Zugangsdaten gehen nur an genau diesen Server."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.host = cfg["s4t_host"].strip()
+        self.pin = cfg["s4t_cert_sha256"].strip().upper()
+        self.auth = "Basic " + base64.b64encode(f'{cfg["s4t_user"]}:{cfg.s4t_password}'.encode()).decode()
+
+    def _call(self, method, request_xml):
+        param = S4T_PARAM.get(method, "requestData")
+        envelope = (f'<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ws="{S4T_NS}">'
+                    f'<soapenv:Body><ws:{method}><ws:{param}>{xml_escape(request_xml)}</ws:{param}></ws:{method}>'
+                    '</soapenv:Body></soapenv:Envelope>')
+        ctx = ssl.create_default_context()
+        ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE  # ersetzt durch den Fingerabdruck-Vergleich
+        c = http.client.HTTPSConnection(self.host, 443, context=ctx, timeout=120)
+        try:
+            try:
+                c.connect()
+            except OSError as e:
+                raise S4TError(f"Speed4Trade nicht erreichbar ({self.host}): {e}")
+            fp = hashlib.sha256(c.sock.getpeercert(binary_form=True)).hexdigest().upper()
+            if not self.pin or fp != self.pin:
+                raise S4TError("Das Zertifikat des Speed4Trade-Servers stimmt nicht mit dem bestätigten überein. "
+                               "Es wurde nichts gesendet. Bitte unter Einstellungen → Speed4Trade prüfen.")
+            c.request("POST", S4T_PATH, body=envelope.encode("utf-8"),
+                      headers={"Authorization": self.auth, "Content-Type": "text/xml; charset=utf-8",
+                               "SOAPAction": "urn:" + method})
+            r = c.getresponse()
+            body = r.read()
+        finally:
+            c.close()
+        if r.status == 401:
+            raise S4TError("Speed4Trade hat die Anmeldung abgelehnt (Benutzer/Passwort prüfen).")
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError:
+            raise S4TError(f"Speed4Trade: unerwartete Antwort (HTTP {r.status})")
+        fault = root.find(".//{*}Fault/faultstring")
+        if fault is not None:
+            raise S4TError(f"Speed4Trade: {fault.text}")
+        ret = root.find(".//{*}return")
+        if ret is None or not ret.text:
+            raise S4TError(f"Speed4Trade: leere Antwort (HTTP {r.status})")
+        resp = ET.fromstring(ret.text.encode("utf-8"))
+        rep = resp.find("report")
+        if rep is not None and int(rep.get("return_code", "0")) < 0:
+            raise S4TError(f"Speed4Trade meldet Fehler {rep.get('return_code')}: "
+                           f"{(rep.findtext('.//error_description') or '').strip()}")
+        return resp
+
+    def test(self):
+        resp = self._call("fetchMandators", '<request method="fetchMandators" version="1.0.0"></request>')
+        return [(m.findtext("mandator_id"), m.findtext("identifier")) for m in resp.findall("mandator")]
+
+    def fetch_orders(self, default_weight):
+        """Aufträge im eingestellten Status (130 = bezahlt, Versand offen), optional nur mit einem Kennzeichen."""
+        c = self.cfg
+        flt = (f'<mandator_id filter_method="=" filter_value="{int(c["s4t_mandator"] or 1)}"/>'
+               f'<order_status_id filter_method="=" filter_value="{int(c["s4t_status_id"] or 130)}"/>')
+        if c["s4t_tag"].strip():  # Filter erwartet den Namen des Kennzeichens, nicht die ID
+            flt += (f'<order_tags filter_method="IN"><filter_values><filter_value>{xml_escape(c["s4t_tag"].strip())}'
+                    '</filter_value></filter_values></order_tags>')
+        orders, page = [], 1
+        while True:
+            resp = self._call("fetchOrders", f'<request method="fetchOrders" version="1.0.0"><filter>{flt}</filter>'
+                                             '<use_modification_context_filter>false</use_modification_context_filter>'
+                                             f'<orders_per_page>100</orders_per_page><page>{page}</page></request>')
+            found = resp.findall("order")
+            orders += [s4t_order(x, default_weight) for x in found]
+            pages = int(resp.findtext("report/total_number_of_pages") or 1)
+            if page >= pages or not found:
+                return orders
+            page += 1
+
+    def report_shipped(self, o: Order):
+        """Versand mit Sendungsnummer(n) melden – S4T setzt den Status im passenden Workflow auf versendet."""
+        infos = "".join(f"<shipping_information><tracking_number>{xml_escape(t)}</tracking_number>"
+                        "<shipping_provider_identifier>DHL</shipping_provider_identifier>"
+                        f"<shipping_date>{dt.datetime.now():%Y-%m-%dT%H:%M:%S}</shipping_date></shipping_information>"
+                        for t in o.tracking.split(", ") if t)
+        self._call("updateOrderStatus",
+                   f'<request method="updateOrderStatus" version="1.0.0"><order significant_key="order_id">'
+                   f'<mandator_id>{int(self.cfg["s4t_mandator"] or 1)}</mandator_id><order_id>{int(o.s4t_id)}</order_id>'
+                   f'<status>SHIPPED</status><shipping_informations>{infos}</shipping_informations></order></request>')
+
+
+def s4t_order(x, default_weight):
+    """fetchOrders-<order> in einen Auftrag des Tools umwandeln (gleiche Prüfungen wie beim CSV-Import)."""
+    t = lambda el, tag: (el.findtext(tag) or "").strip() if el is not None else ""
+    o = Order(t(x, "order_number"))
+    o.s4t_id, o.ebay = t(x, "order_id"), t(x, "specific_order_data/ebay_order_data/ebay_order_number")
+    a = x.find("shipping_address")
+    o.name = " ".join(p for p in (t(a, "first_name"), t(a, "last_name")) if p)
+    o.company, o.street, o.house = t(a, "firm"), t(a, "street"), t(a, "house_number")
+    o.addr2, o.zip, o.city = t(a, "street_addition"), t(a, "postal_code"), t(a, "city")
+    o.country, o.phone = t(a, "country_code_iso").upper(), t(a, "phone_number")
+    if not o.street and t(a, "street_and_house_number"):
+        o.street = t(a, "street_and_house_number")
+    if not o.name:
+        o.name = o.company
+    em = next((e.text.strip() for e in x.iter("email_address") if e.text and e.text.strip()), "")
+    if em and not EMAIL_RX.match(em):
+        o.hints.append(f"E-Mail ungültig, nicht übernommen ({em})")
+        em = ""
+    o.email = em
+    if not re.fullmatch(r"[A-Z]{2}", o.country):
+        o.hints.append(f"Land unklar ('{o.country}'), DE angenommen")
+        o.country = "DE"
+    _fix_address(o)
+    for it in x.findall("order_items/order_item"):
+        kind = t(it, "type") or "0"
+        qty = (_num(t(it, "quantity")) or 0) - (_num(t(it, "canceled_quantity")) or 0)
+        if qty <= 0 or kind in ("3", "4"):  # storniert, Serviceleistung, Retoure
+            continue
+        item = {"sku": t(it, "internal_item_number") or t(it, "item_id"), "name": t(it, "order_item_identifier"),
+                "qty": qty, "price": _num(t(it, "price")) or 0.0, "ean": "", "weight": None}
+        if kind in ("1", "2") or item["price"] < 0:
+            item["price"] = -abs(item["price"])
+            o.discounts.append(item)
+        else:
+            o.items.append(item)
+    grams = _num(t(x, "weight_in_gram"))
+    _set_weight(o, grams / 1000 if grams else None, default_weight)
+    o.hints.insert(0, "Aus Speed4Trade abgeholt" + (f", eBay-Bestellung {o.ebay}" if o.ebay else ""))
+    return o
 
 
 A6_PT = (297.64, 419.53)  # 105 × 148 mm
@@ -1023,12 +1226,28 @@ class App(tk.Tk):
         bar = tk.Frame(self, bg=C["steel"], padx=14, pady=10)
         bar.pack(fill="x")
         tk.Label(bar, text="BOB Versand", bg=C["steel"], fg="white", font=F["brand"]).pack(side="left", padx=(0, 22))
-        self.btn_open = FlatButton(bar, "Importieren…", self.open_file, "bar")
-        self.btn_open.pack(side="left")
-        tk.Frame(bar, bg=C["steel_line"], width=1).pack(side="left", fill="y", padx=10, pady=4)
+        self.btn_s4t = FlatButton(bar, "Aus S4T abholen", self.fetch_s4t, "bar")
+        self.btn_s4t.pack(side="left")
+        self.btn_open = FlatButton(bar, "CSV importieren…", self.open_file, "bar")
+        self.btn_open.pack(side="left", padx=(2, 0))
+        # Bearbeiten/Manuell/Löschen gibt es auch per Doppelklick, Rechtsklick und Entf – bei schmalem Fenster
+        # werden sie ausgeblendet, damit Senden/Drucken/Exportieren rechts nie abgeschnitten werden
+        edit_box = tk.Frame(bar, bg=C["steel"])
+        tk.Frame(edit_box, bg=C["steel_line"], width=1).pack(side="left", fill="y", padx=10, pady=4)
         for text, cmd in (("Bearbeiten", self.edit_current), ("Manuell versendet…", self.mark_manual),
                           ("Löschen", self.delete_orders)):
-            FlatButton(bar, text, cmd, "bar").pack(side="left", padx=(0, 2))
+            FlatButton(edit_box, text, cmd, "bar").pack(side="left", padx=(0, 2))
+
+        def fit_bar():
+            # nach dem Layout ausführen, sonst sind die benötigten Breiten beim Start noch nicht berechnet
+            shown = edit_box.winfo_ismapped()
+            show = bar.winfo_width() >= bar.winfo_reqwidth() + (0 if shown else edit_box.winfo_reqwidth())
+            if show and not shown:
+                edit_box.pack(side="left", fill="y", after=self.btn_open)
+            elif not show and shown:
+                edit_box.pack_forget()
+        edit_box.pack(side="left", fill="y")
+        bar.bind("<Configure>", lambda e: self.after_idle(fit_bar))
         FlatButton(bar, "Einstellungen", self.settings, "bar").pack(side="right")
         tk.Frame(bar, bg=C["steel_line"], width=1).pack(side="right", fill="y", padx=10, pady=4)
         self.btn_send = FlatButton(bar, "Ausgewählte senden", self.send_selected, "primary")
@@ -1397,6 +1616,17 @@ class App(tk.Tk):
             ship += [("\nLabel\t", "muted"),
                      (f"gedruckt {o.printed}" if o.printed else f"{len(o.label_paths)} PDF bereit"
                       if o.label_paths else "keins", "ok" if o.label_paths else "muted")]
+        if o.s4t_id:
+            if o.s4t_reported:
+                s4t = (f"als versendet gemeldet {o.s4t_reported[8:10]}.{o.s4t_reported[5:7]}. {o.s4t_reported[11:16]}", "ok")
+            elif o.s4t_error:
+                s4t = ("Meldung fehlgeschlagen", "warn")
+            else:
+                s4t = ("wird beim Senden gemeldet" if self.cfg["s4t_report"] == "1" and not o.tracking
+                       else "nicht gemeldet", "muted")
+            ship += [("\nS4T\t", "muted"), s4t]
+        if o.ebay:
+            ship += [("\neBay\t", "muted"), (o.ebay, "small")]
         if o.note:
             ship += [("\nNotiz\t", "muted"), (o.note, "")]
         if BACKEND is not None and o.updated_by:
@@ -1420,6 +1650,8 @@ class App(tk.Tk):
             hints.append(("✖  " + e, "err"))
         if o.error:
             hints.append(("✖  Sendcloud: " + o.error, "err"))
+        if o.s4t_error and not o.s4t_reported:
+            hints.append(("✖  Speed4Trade: " + o.s4t_error + " – per Rechtsklick erneut melden", "err"))
         if o.local_msg:
             hints.append(("⚠  " + o.local_msg, "warn"))
         if o.needs_review:
@@ -1451,10 +1683,55 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror(APP_NAME, f"Datei konnte nicht gelesen werden:\n{e}")
             return
+        self._add_orders(new, path, f"Import aus {os.path.basename(path)}")
+
+    def fetch_s4t(self):
+        """Offene Aufträge (Status „bezahlt, Versand offen“) direkt aus Speed4Trade abholen."""
+        if self.busy:
+            return
+        if not self.cfg.s4t_ready:
+            messagebox.showinfo(APP_NAME, "Die Speed4Trade-Anbindung ist noch nicht eingerichtet.")
+            S4TDialog(self, self.cfg)
+            if not self.cfg.s4t_ready:
+                return
+        self.busy = True
+        for b in (self.btn_send, self.btn_open, self.btn_export, self.btn_s4t):
+            b.state(["disabled"])
+        self.status.set("Hole offene Aufträge aus Speed4Trade…")
+        self.progress.configure(mode="indeterminate")
+        self.progress.start(15)
+
+        def run():
+            try:
+                self.q.put(("s4t", S4T(self.cfg).fetch_orders(_num(self.cfg["default_weight_kg"]) or 2.01)))
+            except Exception as e:
+                self.q.put(("s4t", e))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _s4t_fetched(self, result):
+        self.busy = False
+        for b in (self.btn_send, self.btn_open, self.btn_export, self.btn_s4t):
+            b.state(["!disabled"])
+        self.progress.stop()
+        self.progress.configure(mode="determinate", value=0)
+        if isinstance(result, Exception):
+            self._update_status("Abholen aus Speed4Trade fehlgeschlagen.")
+            messagebox.showerror(APP_NAME, f"Abholen aus Speed4Trade fehlgeschlagen:\n\n{result}")
+            return
+        if not result:
+            self._update_status("Speed4Trade: keine neuen Aufträge.")
+            tag = self.cfg["s4t_tag"].strip()
+            messagebox.showinfo(APP_NAME, "In Speed4Trade sind keine offenen Aufträge"
+                                + (f" mit dem Kennzeichen „{tag}“." if tag else "."))
+            return
+        self._add_orders(result, "Speed4Trade", "Abholung aus Speed4Trade")
+
+    def _add_orders(self, new, source, title):
+        """Neue Aufträge der Liste hinzufügen (CSV-Import oder Speed4Trade)."""
         # Früher gelöschte Aufträge nicht ungefragt wieder aufnehmen
         hidden = [o.ref for o in new if o.ref in self.deleted]
         if hidden:
-            if messagebox.askyesno(APP_NAME, f"{len(hidden)} Aufträge dieser Datei wurden früher aus der Liste "
+            if messagebox.askyesno(APP_NAME, f"{len(hidden)} dieser Aufträge wurden früher aus der Liste "
                                              "gelöscht:\n" + ", ".join(hidden[:25]) +
                                    "\n\nWieder anzeigen? (Nein = weiterhin ausblenden)"):
                 for ref in hidden:
@@ -1464,7 +1741,7 @@ class App(tk.Tk):
             else:
                 new = [o for o in new if o.ref not in self.deleted]
         if BACKEND is not None:
-            return self._import_shared(path, new)
+            return self._import_shared(source, new, title)
         # Erledigte Aufträge (Label gedruckt + Sendungsnummer exportiert) aus der Liste nehmen
         finished = self._cleanup_finished(refresh=False)
         # Neue Aufträge HINZUFÜGEN: vorhandene behalten ihren Stand, erledigte kommen nicht wieder
@@ -1473,7 +1750,8 @@ class App(tk.Tk):
         added = [o for o in new if o.ref not in existing and o.ref not in self.completed]
         already = sum(o.ref in existing for o in new)
         self.orders += added
-        self.source = path
+        linked = self._link_s4t(new)
+        self.source = source
         if self.cfg["use_history"] == "1":
             self._apply_history_cached()
         self.refresh()
@@ -1481,13 +1759,24 @@ class App(tk.Tk):
         self.save_session()
         parts = [f"{len(added)} neue Aufträge hinzugefügt"]
         if already:
-            parts.append(f"{already} bereits in der Liste")
+            parts.append(f"{already} bereits in der Liste" + (f" ({linked} mit Speed4Trade verknüpft)" if linked else ""))
         if skipped_done:
             parts.append(f"{len(skipped_done)} schon erledigt (übersprungen)")
         if finished:
             parts.append(f"{len(finished)} erledigte entfernt")
         self._update_status(", ".join(parts) + ".")
-        messagebox.showinfo(APP_NAME, f"Import aus {os.path.basename(path)}:\n\n• " + "\n• ".join(parts))
+        messagebox.showinfo(APP_NAME, f"{title}:\n\n• " + "\n• ".join(parts))
+
+    def _link_s4t(self, new):
+        """Aufträge, die schon aus einer CSV in der Liste stehen, mit Speed4Trade verknüpfen (für die Rückmeldung)."""
+        by_ref = {o.ref: o for o in new if o.s4t_id}
+        n = 0
+        for o in self.orders:
+            src = by_ref.get(o.ref)
+            if src and not o.s4t_id:
+                o.s4t_id, o.ebay = src.s4t_id, o.ebay or src.ebay
+                n += 1
+        return n
 
     def _cleanup_finished(self, refresh=True):
         """Erledigte Aufträge (versendet, Label gedruckt, Sendungsnummer exportiert) sofort aus der Liste nehmen.
@@ -1514,7 +1803,7 @@ class App(tk.Tk):
             self.save_session()
         return removed
 
-    def _import_shared(self, path, new):
+    def _import_shared(self, source, new, title):
         """Import in den gemeinsamen Ordner: nur hinzufügen; Erledigte werden für alle entfernt."""
         self._push()
         res = {"added": 0, "already": 0, "completed": 0, "deleted": 0}
@@ -1532,15 +1821,17 @@ class App(tk.Tk):
         except (OSError, Conflict) as e:
             messagebox.showerror(APP_NAME, f"Import in den gemeinsamen Ordner fehlgeschlagen:\n{e}")
             return
-        self.source = path
+        self.source = source
         self._sig = None
         self.tree.delete(*self.tree.get_children())
         self._merge_remote(None, records, hidden)
+        linked = self._link_s4t(new)  # wird mit dem nächsten Speichern in den gemeinsamen Ordner übertragen
         self.refresh()
         self.save_session()
         parts = [f"{res['added']} neue Aufträge hinzugefügt"]
         if res["already"]:
-            parts.append(f"{res['already']} bereits in der Liste")
+            parts.append(f"{res['already']} bereits in der Liste"
+                         + (f" ({linked} mit Speed4Trade verknüpft)" if linked else ""))
         if res["completed"]:
             parts.append(f"{res['completed']} schon erledigt (übersprungen)")
         if res["deleted"]:
@@ -1548,8 +1839,7 @@ class App(tk.Tk):
         if finished:
             parts.append(f"{len(finished)} erledigte entfernt")
         self._update_status(", ".join(parts) + ".")
-        messagebox.showinfo(APP_NAME, f"Import aus {os.path.basename(path)} in die gemeinsame Liste:\n\n• "
-                            + "\n• ".join(parts))
+        messagebox.showinfo(APP_NAME, f"{title} in die gemeinsame Liste:\n\n• " + "\n• ".join(parts))
 
     # ----- Erfahrungswerte aus früheren Sendungen
     def _apply_history_cached(self):
@@ -1569,7 +1859,7 @@ class App(tk.Tk):
         if self.busy:
             return
         self.busy = True
-        for b in (self.btn_send, self.btn_open, self.btn_export):
+        for b in (self.btn_send, self.btn_open, self.btn_export, self.btn_s4t):
             b.state(["disabled"])
         self.status.set("Lade Erfahrungswerte (Gewicht/Pakete) aus früheren Sendcloud-Sendungen…")
         self.progress.configure(mode="indeterminate")
@@ -1635,7 +1925,7 @@ class App(tk.Tk):
         if not messagebox.askyesno(APP_NAME, msg):
             return
         self.busy = True
-        for b in (self.btn_send, self.btn_open, self.btn_export):
+        for b in (self.btn_send, self.btn_open, self.btn_export, self.btn_s4t):
             b.state(["disabled"])
         self.progress.configure(maximum=len(sel), value=0)
         threading.Thread(target=self._worker, args=(sel,), daemon=True).start()
@@ -1647,6 +1937,41 @@ class App(tk.Tk):
                 store_label(o, tracking, sc.label_pdf(pid), self.cfg)
             except Exception as e:
                 o.hints.append(f"Label-PDF für {tracking} nicht geladen: {e}")
+
+    def _report_s4t(self, o):
+        """Versand mit Sendungsnummer an Speed4Trade melden. Fehler werden am Auftrag vermerkt, nicht geworfen."""
+        try:
+            S4T(self.cfg).report_shipped(o)
+            o.s4t_reported, o.s4t_error = dt.datetime.now().isoformat(timespec="minutes"), ""
+            o.exported = True  # Sendungsnummer ist in Speed4Trade – kein CSV-Export mehr nötig
+            append_log(o, "Versand an Speed4Trade gemeldet")
+            return True
+        except Exception as e:
+            o.s4t_error = str(e)
+            append_log(o, f"Meldung an Speed4Trade fehlgeschlagen: {e}")
+            return False
+
+    def report_s4t_current(self):
+        iid = self.tree.focus()
+        if not iid or self.busy:
+            return
+        o = self.orders[int(iid)]
+        if not (o.s4t_id and o.tracking and not o.s4t_reported):
+            return
+        if not messagebox.askyesno(APP_NAME, f"Auftrag {o.ref} in Speed4Trade als versendet melden?\n\n"
+                                             f"Sendungsnummer(n): {o.tracking}"):
+            return
+        self.configure(cursor="watch")
+        self.update()
+        try:
+            ok = self._report_s4t(o)
+        finally:
+            self.configure(cursor="")
+        self._after_change(iid)
+        if ok:
+            self._cleanup_finished()
+        else:
+            messagebox.showerror(APP_NAME, f"Meldung an Speed4Trade fehlgeschlagen:\n\n{o.s4t_error}")
 
     def _worker(self, sel):
         sc = Sendcloud(self.cfg)
@@ -1702,6 +2027,8 @@ class App(tk.Tk):
                             append_log(o, f"Label erstellt ({len(tracks)} von {o.parcels} Paketen)")
                     o.status = "Label erstellt"
                 o.selected = False
+                if o.s4t_id and self.cfg["s4t_report"] == "1" and not o.s4t_reported:
+                    self._report_s4t(o)
             except Exception as e:
                 o.status, o.error = "Fehler", str(e)
                 if o.tracking:  # Mehrpaket-Sendung nur teilweise angelegt
@@ -1741,6 +2068,8 @@ class App(tk.Tk):
                         self._set_share_info()
                 elif kind == "printjob":
                     self._print_finished(*val)
+                elif kind == "s4t":
+                    self._s4t_fetched(val)
                 elif kind == "update":
                     self._show_update(*val)
                 elif kind == "update_progress":
@@ -1751,7 +2080,7 @@ class App(tk.Tk):
                 elif kind == "history":
                     data, notify = val
                     self.busy = False
-                    for b in (self.btn_send, self.btn_open, self.btn_export):
+                    for b in (self.btn_send, self.btn_open, self.btn_export, self.btn_s4t):
                         b.state(["!disabled"])
                     self.progress.stop()
                     self.progress.configure(mode="determinate", value=0)
@@ -1773,19 +2102,22 @@ class App(tk.Tk):
                     self._update_status()
                 elif kind == "done":
                     self.busy = False
-                    for b in (self.btn_send, self.btn_open, self.btn_export):
+                    for b in (self.btn_send, self.btn_open, self.btn_export, self.btn_s4t):
                         b.state(["!disabled"])
                     self.save_session()
                     ok = sum(o.status == "Label erstellt" for o in self.orders)
                     ex = sum(o.status == "bereits vorhanden" for o in self.orders)
                     err = [o for o in self.orders if o.status in ("Fehler", "teilweise")]
                     skipped = [o for o in self.orders if o.local_msg]
+                    s4t_bad = [o for o in self.orders if o.s4t_error and o.tracking and not o.s4t_reported]
                     self._update_status()
                     messagebox.showinfo(APP_NAME, f"Fertig.\n\nLabels erstellt: {ok}\nBereits vorhanden: {ex}\n"
                                                   f"Fehler: {len(err)}" + ("\n\n" + "\n".join(
                                                       f"{o.ref}: {o.error[:150]}" for o in err[:8]) if err else "")
                                         + ("\n\nÜbersprungen (Kollegen):\n" + "\n".join(
-                                            f"{o.ref}: {o.local_msg}" for o in skipped[:8]) if skipped else ""))
+                                            f"{o.ref}: {o.local_msg}" for o in skipped[:8]) if skipped else "")
+                                        + ("\n\nNicht an Speed4Trade gemeldet (Rechtsklick → nachholen):\n" + "\n".join(
+                                            f"{o.ref}: {o.s4t_error[:150]}" for o in s4t_bad[:8]) if s4t_bad else ""))
                     for o in skipped:
                         o.local_msg = ""
         except queue.Empty:
@@ -2152,6 +2484,9 @@ class App(tk.Tk):
         m.add_command(label="Label öffnen", command=self.open_label, state="normal" if o.label_paths else "disabled")
         m.add_command(label="Als „nicht gedruckt“ markieren", command=self.reset_printed,
                       state="normal" if o.printed else "disabled")
+        if o.s4t_id:
+            m.add_command(label="An Speed4Trade als versendet melden…", command=self.report_s4t_current,
+                          state="normal" if o.tracking and not o.s4t_reported else "disabled")
         m.add_separator()
         m.add_command(label="Aus Liste löschen…", command=lambda: self.delete_orders([o]))
         m.tk_popup(e.x_root, e.y_root)
@@ -2767,7 +3102,9 @@ class SettingsDialog(tk.Toplevel):
             row=r + 1, column=0, columnspan=2, sticky="w", pady=(8, 0))
         b = ttk.Frame(f)
         b.grid(row=r + 2, column=0, columnspan=2, sticky="e", pady=(10, 0))
-        ttk.Button(b, text="Protokoll öffnen", command=self.open_log).pack(side="left", padx=(0, 16))
+        ttk.Button(b, text="Protokoll öffnen", command=self.open_log).pack(side="left", padx=(0, 6))
+        ttk.Button(b, text="Speed4Trade-Anbindung…", command=lambda: S4TDialog(self, self.cfg)).pack(
+            side="left", padx=(0, 16))
         ttk.Button(b, text="Speichern", command=self.ok).pack(side="left")
         ttk.Button(b, text="Abbrechen", command=self.destroy).pack(side="left", padx=(6, 0))
         self.grab_set()
@@ -2853,6 +3190,124 @@ class SettingsDialog(tk.Toplevel):
         d = filedialog.askdirectory(parent=self, title="Gemeinsamen Ordner wählen")
         if d:
             self.shared_dir.set(os.path.normpath(d))
+
+
+class S4TDialog(tk.Toplevel):
+    FIELDS = [("s4t_host", "Server (Adresse/IP)"), ("s4t_user", "Webservice-Benutzer"),
+              ("s4t_status_id", "Auftragsstatus-ID"), ("s4t_mandator", "Mandant"),
+              ("s4t_tag", "Nur mit Kennzeichen (optional)")]
+
+    def __init__(self, master, cfg: Config):
+        super().__init__(master)
+        self.cfg = cfg
+        self.title("Speed4Trade-Anbindung")
+        self.resizable(False, False)
+        self.transient(master)
+        f = ttk.Frame(self, padding=14)
+        f.pack(fill="both")
+        ttk.Label(f, text="Abgeholt werden alle Aufträge im angegebenen Status (130 = bezahlt, Versand offen). "
+                          "Optional lässt sich auf ein Auftragskennzeichen einschränken.", foreground=C["muted"],
+                  wraplength=460).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        self.vars = {}
+        self.pw = tk.StringVar(value=cfg.s4t_password)
+        r = 1
+        for k, label in self.FIELDS:
+            ttk.Label(f, text=label).grid(row=r, column=0, sticky="w", pady=2)
+            self.vars[k] = tk.StringVar(value=cfg[k])
+            ttk.Entry(f, textvariable=self.vars[k], width=40).grid(row=r, column=1, sticky="w", padx=(8, 0))
+            r += 1
+            if k == "s4t_user":
+                ttk.Label(f, text="Passwort").grid(row=r, column=0, sticky="w", pady=2)
+                ttk.Entry(f, textvariable=self.pw, width=40, show="•").grid(row=r, column=1, sticky="w", padx=(8, 0))
+                r += 1
+        r -= 1
+        self.report = tk.BooleanVar(value=cfg["s4t_report"] == "1")
+        ttk.Checkbutton(f, text="Nach dem Senden Sendungsnummer an Speed4Trade melden (Status „versendet“)",
+                        variable=self.report).grid(row=r + 1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.pin = cfg["s4t_cert_sha256"].strip().upper()
+        self.pin_label = ttk.Label(f, text="", foreground=C["muted"])
+        self.pin_label.grid(row=r + 2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self._show_pin()
+        b = ttk.Frame(f)
+        b.grid(row=r + 3, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        ttk.Button(b, text="Verbindung testen", command=self.test).pack(side="left", padx=(0, 16))
+        ttk.Button(b, text="Speichern", command=self.ok).pack(side="left")
+        ttk.Button(b, text="Abbrechen", command=self.destroy).pack(side="left", padx=(6, 0))
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.grab_set()
+        self.wait_window()
+
+    def _show_pin(self):
+        self.pin_label.configure(text=f"Server-Zertifikat bestätigt: {self.pin[:8]}…{self.pin[-8:]}" if self.pin
+                                 else "Server-Zertifikat noch nicht bestätigt – „Verbindung testen“ klicken.")
+
+    def _apply(self, cfg):
+        for k, v in self.vars.items():
+            cfg[k] = v.get().strip()
+        cfg.s4t_password = self.pw.get()
+        cfg["s4t_report"] = "1" if self.report.get() else "0"
+        cfg["s4t_cert_sha256"] = self.pin
+
+    def _confirm_cert(self):
+        """Fingerabdruck abrufen (ohne Zugangsdaten) und bei neuem/geändertem Zertifikat bestätigen lassen."""
+        host = self.vars["s4t_host"].get().strip()
+        if not host:
+            messagebox.showerror(APP_NAME, "Bitte die Server-Adresse eintragen.", parent=self)
+            return False
+        try:
+            fp = s4t_fingerprint(host)
+        except OSError as e:
+            messagebox.showerror(APP_NAME, f"Server nicht erreichbar:\n{e}", parent=self)
+            return False
+        if fp == self.pin:
+            return True
+        pretty = ":".join(fp[i:i + 2] for i in range(0, len(fp), 2))
+        msg = ("Das Zertifikat des Servers hat sich GEÄNDERT.\n\n" if self.pin else
+               "Der Server nutzt ein eigenes (selbst ausgestelltes) Zertifikat.\n\n")
+        msg += (f"SHA-256-Fingerabdruck:\n{pretty[:47]}\n{pretty[48:]}\n\nNur bestätigen, wenn das der "
+                "Speed4Trade-Server ist (im Zweifel die IT fragen). Die Zugangsdaten werden danach nur an genau "
+                "diesen Server gesendet.\n\nZertifikat vertrauen?")
+        if not messagebox.askyesno(APP_NAME, msg, icon="warning" if self.pin else "question", parent=self):
+            return False
+        self.pin = fp
+        self._show_pin()
+        return True
+
+    def test(self):
+        if not self._confirm_cert():
+            return
+        tmp = Config.__new__(Config)  # Kopie: Test ohne die gespeicherten Einstellungen zu ändern
+        tmp.cp = configparser.ConfigParser()
+        tmp.cp.read_dict(self.cfg.cp)
+        self._apply(tmp)
+        self.configure(cursor="watch")
+        self.update()
+        try:
+            mandators = S4T(tmp).test()
+            messagebox.showinfo(APP_NAME, "Verbindung zu Speed4Trade erfolgreich.\n\nMandanten:\n"
+                                + "\n".join(f"{i}: {n}" for i, n in mandators), parent=self)
+        except Exception as e:
+            messagebox.showerror(APP_NAME, str(e), parent=self)
+        finally:
+            self.configure(cursor="")
+
+    def ok(self):
+        for k in ("s4t_status_id", "s4t_mandator"):
+            if not self.vars[k].get().strip().isdigit():
+                messagebox.showerror(APP_NAME, "Status-ID und Mandant müssen Zahlen sein.", parent=self)
+                return
+        if self.vars["s4t_host"].get().strip() and not self.pin and not self._confirm_cert():
+            return
+        self._apply(self.cfg)
+        self.cfg.save()
+        if BACKEND is not None:
+            try:
+                BACKEND.put_settings({k: self.cfg[k] for k in SHARED_SETTINGS})
+            except OSError as e:
+                messagebox.showwarning(APP_NAME, f"Lokal gespeichert, aber nicht im gemeinsamen Ordner:\n{e}",
+                                       parent=self)
+        self.destroy()
 
 
 def selftest(path):

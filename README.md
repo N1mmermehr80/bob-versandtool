@@ -1,12 +1,12 @@
 # BOB Sendcloud-Versand
 
-Liest den S4T-Versandexport (`GLS_*.csv`, versendet wird mit DHL), legt ausgewählte Aufträge als DHL-Sendung bei Sendcloud an und exportiert die Sendungsnummern.
+Holt offene Aufträge direkt aus Speed4Trade CONNECT (oder liest den S4T-Versandexport `GLS_*.csv`), legt ausgewählte Aufträge als DHL-Sendung bei Sendcloud an und meldet die Sendungsnummern an Speed4Trade zurück (bzw. exportiert sie als CSV).
 
 **Programm:** `dist\BOB-Sendcloud-Versand.exe` – eine einzelne Datei, keine Installation nötig.
 
 ## Ablauf
 
-1. **📂 Datei öffnen:** S4T-Export wählen.
+1. **Aus S4T abholen:** Holt alle Aufträge mit Status 130 „bezahlt, Versand offen“ aus Speed4Trade. Alternativ **CSV importieren…** für den S4T-Export.
 2. **Prüfen:** Farbe der Zeile beachten (siehe unten). Per Doppelklick lassen sich Adresse, Paketanzahl und Gewicht ändern.
 3. **Auswählen:** Häkchen in der ersten Spalte setzen (Klick oder Leertaste) oder „Alle auswählen“ nutzen.
 4. **🚚 Senden:** Ausgewählte Aufträge an Sendcloud senden. Die Sendungen werden bei DHL angemeldet, die Labels liegen danach zum Drucken im Sendcloud-Panel.
@@ -46,6 +46,17 @@ Automatisch korrigierte Aufträge bleiben weiß, Details dazu stehen im Hinweisb
 | grün | Label erstellt |
 | blau | war schon in Sendcloud vorhanden |
 | lila | manuell versendet |
+
+## Speed4Trade-Anbindung
+
+Einrichten unter **Einstellungen → Speed4Trade-Anbindung…**: Server-Adresse, Webservice-Benutzer und Passwort. Liegt eine `.env` mit `S4T_IP`, `S4T_Benutzername` und `S4T_Passwort` neben der exe, werden die Werte beim ersten Start übernommen.
+
+- **Abholen:** alle Aufträge im eingestellten Status (Standard 130 = bezahlt, Versand offen). Optional lässt sich auf ein Auftragskennzeichen einschränken. Aufträge, die schon in der Liste stehen, bleiben unverändert.
+- **Rückmeldung:** Nach dem Senden meldet das Tool den Versand mit Sendungsnummer (DHL) an Speed4Trade. Speed4Trade setzt den Auftrag dann auf „versendet“, beim nächsten Abholen kommt er nicht wieder. Gemeldete Aufträge gelten als exportiert, ein CSV-Export ist für sie nicht mehr nötig.
+- **Fehler bei der Rückmeldung:** Das Label bleibt gültig. Der Auftrag zeigt den Fehler in den Hinweisen, die Meldung lässt sich per **Rechtsklick → An Speed4Trade als versendet melden…** nachholen. Darüber lassen sich auch manuell versendete Aufträge mit Sendungsnummer melden.
+- **Gewicht:** Speed4Trade liefert in den Aufträgen kein Gewicht. Es gelten die Regeln unten (Erfahrungswerte, Radsatz-Regel, sonst 2,01 kg).
+- **Zertifikat:** Der Server nutzt ein selbst ausgestelltes Zertifikat. Beim ersten „Verbindung testen“ zeigt das Tool den Fingerabdruck zur Bestätigung. Danach gehen die Zugangsdaten nur an genau diesen Server. Ändert sich das Zertifikat, bricht das Tool ab, ohne etwas zu senden, und fragt beim nächsten Test erneut.
+- Server, Status, Mandant, Kennzeichen und der bestätigte Fingerabdruck gelten für alle Arbeitsplätze (gemeinsamer Ordner). Benutzer und Passwort bleiben pro PC.
 
 ## Mehrere Arbeitsplätze (gemeinsame Liste)
 
@@ -98,7 +109,7 @@ Bei mehreren Paketen wird je Paket eine eigene Sendung mit derselben Auftragsnum
   - Label-PDFs (`labels\`) und Sammeldrucke (`sammeldruck\`)
   - Protokoll aller Sendungen (`sendungen_log.csv`)
   - Erfahrungswerte
-- **Zugangsdaten:** Die API-Schlüssel werden mit Windows-DPAPI verschlüsselt gespeichert und sind nur für den eigenen Windows-Benutzer lesbar. Beim ersten Start werden sie aus einer `.env` neben der exe übernommen, falls vorhanden.
+- **Zugangsdaten:** Die Sendcloud-Schlüssel und das Speed4Trade-Passwort werden mit Windows-DPAPI verschlüsselt gespeichert und sind nur für den eigenen Windows-Benutzer lesbar. Beim ersten Start werden sie aus einer `.env` neben der exe übernommen, falls vorhanden.
 
 ## Updates und neue Versionen (GitHub)
 
