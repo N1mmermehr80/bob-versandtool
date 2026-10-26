@@ -1242,48 +1242,96 @@ def _vtuple(v):
     return tuple(int(x) for x in re.findall(r"\d+", v or "")[:3]) or (0,)
 
 
+UPDATE_ZIP = "BOB-Sendcloud-Versand.zip"  # Ordner-Variante: exe + _internal (startet ohne Entpacken)
+
+
+def is_onefile():
+    """True bei der alten Ein-Datei-Variante, die sich bei jedem Start in einen Temp-Ordner entpackt."""
+    return getattr(sys, "frozen", False) and os.path.normcase(os.path.dirname(getattr(sys, "_MEIPASS", ""))) \
+        != os.path.normcase(os.path.dirname(sys.executable))
+
+
 def check_update(repo):
-    """Neueste Version auf GitHub abfragen. Rückgabe: dict oder None (kein Update)."""
+    """Neueste Version auf GitHub abfragen. Rückgabe: dict oder None (kein Update).
+    Läuft noch die Ein-Datei-Variante und gibt es das ZIP, wird auch bei gleicher Version die Umstellung
+    auf die Ordner-Variante angeboten."""
     req = urllib.request.Request(f"https://api.github.com/repos/{repo}/releases/latest",
                                  headers={"Accept": "application/vnd.github+json",
                                           "User-Agent": f"BOB-Sendcloud-Versand/{APP_VERSION}"})
     with urllib.request.urlopen(req, timeout=15) as r:
         rel = json.loads(r.read())
-    if rel.get("draft") or rel.get("prerelease") or _vtuple(rel.get("tag_name")) <= _vtuple(APP_VERSION):
+    if rel.get("draft") or rel.get("prerelease"):
         return None
-    asset = next((a for a in rel.get("assets", []) if a.get("name") == UPDATE_ASSET), None)
+    assets = {a.get("name"): a for a in rel.get("assets", [])}
+    newer = _vtuple(rel.get("tag_name")) > _vtuple(APP_VERSION)
+    migrate = is_onefile() and UPDATE_ZIP in assets and _vtuple(rel.get("tag_name")) >= _vtuple(APP_VERSION)
+    if not (newer or migrate):
+        return None
+    if UPDATE_ZIP in assets:
+        asset = assets[UPDATE_ZIP]
+    elif is_onefile() or not getattr(sys, "frozen", False):
+        asset = assets.get(UPDATE_ASSET)
+    else:
+        asset = None  # Ordner-Variante lässt sich nicht mit einer einzelnen exe aktualisieren
     if not asset:
         return None
     return {"version": rel["tag_name"].lstrip("vV"), "notes": (rel.get("body") or "").strip(),
             "url": asset["browser_download_url"], "size": asset.get("size"),
-            "sha256": (asset.get("digest") or "").removeprefix("sha256:"), "page": rel.get("html_url", "")}
+            "sha256": (asset.get("digest") or "").removeprefix("sha256:"), "page": rel.get("html_url", ""),
+            "kind": "zip" if asset["name"] == UPDATE_ZIP else "exe", "migrate": not newer}
 
 
-def install_update(info, progress=None):
-    """Neue exe neben die laufende laden, prüfen und austauschen. Kein Adminrecht nötig,
-    solange der Programmordner beschreibbar ist. Gibt den Pfad der (neuen) exe zurück."""
-    import hashlib
-    if not getattr(sys, "frozen", False):
-        raise RuntimeError("Updates funktionieren nur in der exe-Version.")
-    exe = sys.executable
-    new, old = exe + ".neu", exe + ".alt"
+def _download(info, path, progress=None):
     h, done = hashlib.sha256(), 0
     req = urllib.request.Request(info["url"], headers={"User-Agent": f"BOB-Sendcloud-Versand/{APP_VERSION}"})
-    with urllib.request.urlopen(req, timeout=60) as r, open(new, "wb") as f:
+    with urllib.request.urlopen(req, timeout=60) as r, open(path, "wb") as f:
         while chunk := r.read(256 * 1024):
             f.write(chunk)
             h.update(chunk)
             done += len(chunk)
             if progress and info.get("size"):
                 progress(done / info["size"])
+    if info.get("size") and done != info["size"]:
+        raise RuntimeError("Download unvollständig.")
+    if info.get("sha256") and h.hexdigest() != info["sha256"].lower():
+        raise RuntimeError("Prüfsumme stimmt nicht – Update verworfen.")
+
+
+def install_update(info, progress=None):
+    """Update laden. exe (alte Variante): laufende exe umbenennen und ersetzen, Rückgabe der exe.
+    zip (Ordner-Variante): nach <Programmordner>\\_update\\neu entpacken, Rückgabe der neuen exe dort –
+    sie übernimmt nach dem Beenden dieses Prozesses die eigentliche Installation (run_installer)."""
+    import shutil
+    import zipfile
+    if not getattr(sys, "frozen", False):
+        raise RuntimeError("Updates funktionieren nur in der exe-Version.")
+    exe = sys.executable
+    if info.get("kind") == "zip":
+        stage = os.path.join(os.path.dirname(exe), "_update")
+        shutil.rmtree(stage, ignore_errors=True)
+        new_dir = os.path.join(stage, "neu")
+        os.makedirs(new_dir)
+        pkg = os.path.join(stage, "paket.zip")
+        _download(info, pkg, progress)
+        with zipfile.ZipFile(pkg) as z:
+            root = os.path.realpath(new_dir)
+            for name in z.namelist():  # keine Pfade außerhalb des Zielordners
+                if not os.path.realpath(os.path.join(new_dir, name)).startswith(root + os.sep):
+                    raise RuntimeError(f"Ungültiger Pfad im Update-Paket: {name}")
+            z.extractall(new_dir)
+        os.remove(pkg)
+        new_exe = os.path.join(new_dir, UPDATE_ASSET)
+        internal = os.path.join(new_dir, "_internal")
+        if not (os.path.isfile(new_exe) and os.path.isdir(internal)
+                and any(re.fullmatch(r"python3\d+\.dll", f, re.I) for f in os.listdir(internal))):
+            raise RuntimeError("Update-Paket unvollständig – es wurde nichts verändert.")
+        return new_exe
+    new, old = exe + ".neu", exe + ".alt"
     try:
+        _download(info, new, progress)
         with open(new, "rb") as f:
             if f.read(2) != b"MZ":
                 raise RuntimeError("Download ist keine Windows-Programmdatei.")
-        if info.get("size") and done != info["size"]:
-            raise RuntimeError("Download unvollständig.")
-        if info.get("sha256") and h.hexdigest() != info["sha256"].lower():
-            raise RuntimeError("Prüfsumme stimmt nicht – Update verworfen.")
         if os.path.exists(old):
             os.remove(old)
         os.replace(exe, old)          # laufende exe darf umbenannt, aber nicht überschrieben werden
@@ -1299,13 +1347,74 @@ def install_update(info, progress=None):
     return exe
 
 
-def cleanup_old_update():
-    if getattr(sys, "frozen", False):
-        for p in (sys.executable + ".alt", sys.executable + ".neu"):
-            try:
+def run_installer(target, pid):
+    """Läuft als neue exe aus <target>\\_update\\neu: wartet, bis die alte Version beendet ist, sichert sie
+    (*.alt), kopiert sich nach <target> und startet dort. Bei Fehlern wird die alte Version wiederhergestellt."""
+    import shutil
+    import subprocess
+    k32 = ctypes.windll.kernel32
+    k32.OpenProcess.restype = ctypes.c_void_p
+    k32.WaitForSingleObject.argtypes, k32.CloseHandle.argtypes = [ctypes.c_void_p, ctypes.c_uint32], [ctypes.c_void_p]
+    h = k32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+    if h:
+        k32.WaitForSingleObject(h, 60000)
+        k32.CloseHandle(h)
+    src = os.path.dirname(sys.executable)
+    t_exe, t_int = os.path.join(target, UPDATE_ASSET), os.path.join(target, "_internal")
+    env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")
+    moved, created = [], []
+    try:
+        shutil.rmtree(t_int + ".alt", ignore_errors=True)
+        if os.path.exists(t_exe + ".alt"):
+            os.remove(t_exe + ".alt")
+        for p in (t_int, t_exe):
+            if os.path.exists(p):
+                for attempt in range(40):  # die alte exe kann noch kurz gesperrt sein
+                    try:
+                        os.replace(p, p + ".alt")
+                        break
+                    except PermissionError:
+                        if attempt == 39:
+                            raise
+                        time.sleep(0.25)
+                moved.append(p)
+        created.append(t_int)
+        shutil.copytree(os.path.join(src, "_internal"), t_int)
+        created.append(t_exe)
+        shutil.copy2(os.path.join(src, UPDATE_ASSET), t_exe)
+    except Exception as e:
+        for p in created:  # halb kopierte neue Version entfernen, alte zurückholen
+            if os.path.isdir(p):
+                shutil.rmtree(p, ignore_errors=True)
+            elif os.path.exists(p):
                 os.remove(p)
-            except OSError:
-                pass
+        for p in moved:
+            if os.path.exists(p + ".alt"):
+                os.replace(p + ".alt", p)
+        ctypes.windll.user32.MessageBoxW(None, f"Update konnte nicht installiert werden:\n{e}\n\n"
+                                               "Die bisherige Version wird wieder gestartet.", APP_NAME, 0x10)
+        if os.path.exists(t_exe):
+            subprocess.Popen([t_exe], cwd=target, env=env, close_fds=True)
+        return 1
+    subprocess.Popen([t_exe], cwd=target, env=env, close_fds=True)
+    return 0
+
+
+def cleanup_old_update():
+    """Reste früherer Updates entfernen (nicht, wenn diese exe selbst der Installer in _update ist)."""
+    import shutil
+    if not getattr(sys, "frozen", False):
+        return
+    base = os.path.dirname(sys.executable)
+    if os.path.basename(os.path.dirname(base)).lower() == "_update":
+        return
+    for p in (sys.executable + ".alt", sys.executable + ".neu"):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    for d in ("_internal.alt", "_update"):
+        shutil.rmtree(os.path.join(base, d), ignore_errors=True)
 
 
 BACKEND = None  # wird gesetzt, wenn ein gemeinsamer Ordner eingestellt ist
@@ -2452,7 +2561,9 @@ class App(tk.Tk):
                 messagebox.showinfo(APP_NAME, f"Du hast die neueste Version ({APP_VERSION}).")
             return
         self.update_info = info
-        self.update_text.configure(text=f"Neue Version {info['version']} verfügbar (installiert: {APP_VERSION})")
+        self.update_text.configure(text="Schnellere Programmversion verfügbar (einmalige Umstellung)"
+                                   if info.get("migrate") else
+                                   f"Neue Version {info['version']} verfügbar (installiert: {APP_VERSION})")
         self.update_bar.pack(fill="x", after=self._update_anchor)
 
     def do_update(self):
@@ -2463,9 +2574,11 @@ class App(tk.Tk):
             messagebox.showinfo(APP_NAME, "Bitte warten, bis der laufende Vorgang fertig ist.")
             return
         notes = info["notes"][:900] + ("…" if len(info["notes"]) > 900 else "")
-        if not messagebox.askyesno(APP_NAME, f"Auf Version {info['version']} aktualisieren?\n\n"
-                                             + (f"Neu:\n{notes}\n\n" if notes else "")
-                                             + "Das Tool startet danach neu. Deine Arbeitsliste bleibt erhalten."):
+        question = ("Auf die schnellere Programmversion umstellen?\n\nDas Tool liegt danach als Ordner vor "
+                    "(exe + Unterordner „_internal“) und startet ohne Entpacken.\n\n" if info.get("migrate") else
+                    f"Auf Version {info['version']} aktualisieren?\n\n" + (f"Neu:\n{notes}\n\n" if notes else ""))
+        if not messagebox.askyesno(APP_NAME, question + "Das Tool startet danach neu. Deine Arbeitsliste bleibt "
+                                                        "erhalten."):
             return
         if not getattr(sys, "frozen", False):
             messagebox.showinfo(APP_NAME, f"Im Entwicklungsmodus bitte manuell aktualisieren:\n{info['page']}")
@@ -2496,7 +2609,11 @@ class App(tk.Tk):
         # Ohne Reset übernimmt die neue exe den Entpackordner der alten (PyInstaller-onefile) – mit alten
         # Modulen, und er wird beim Beenden gelöscht. Dann hängt der Neustart.
         env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")
-        subprocess.Popen([exe], close_fds=True, env=env)
+        if self.update_info.get("kind") == "zip":  # neue Version installiert sich selbst, sobald wir beendet sind
+            subprocess.Popen([exe, "--install", os.path.dirname(sys.executable), str(os.getpid())],
+                             cwd=os.path.dirname(exe), close_fds=True, env=env)
+        else:
+            subprocess.Popen([exe], close_fds=True, env=env)
         self.destroy()
         return True
 
@@ -3694,6 +3811,8 @@ def selftest(path):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 3 and sys.argv[1] == "--install":
+        sys.exit(run_installer(sys.argv[2], int(sys.argv[3])))
     if len(sys.argv) > 2 and sys.argv[1] == "--selftest":
         selftest(sys.argv[2])
     else:

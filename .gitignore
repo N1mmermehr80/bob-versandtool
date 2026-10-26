@@ -13,3 +13,5 @@ __pycache__/
 *.pdf
 *.json
 !.github/**
+build_ordner/
+dist_ordner/
