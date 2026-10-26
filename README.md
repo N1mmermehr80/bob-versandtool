@@ -122,8 +122,7 @@ Bei mehreren Paketen wird je Paket eine eigene Sendung mit derselben Auftragsnum
 ## Updates und neue Versionen (GitHub)
 
 Das Tool prüft beim Start und danach alle 6 Stunden, ob es auf GitHub eine neuere Version gibt. Wenn ja, erscheint oben ein gelber Hinweis mit **„Jetzt aktualisieren“**:
-- Das Paket (ZIP) wird heruntergeladen, mit der Prüfsumme von GitHub verglichen, nach `_update
-eu` im Programmordner entpackt und auf Vollständigkeit geprüft.
+- Das Paket (ZIP) wird heruntergeladen, mit der Prüfsumme von GitHub verglichen, nach `_update\neu` im Programmordner entpackt und auf Vollständigkeit geprüft.
 - Das Tool beendet sich. Die neue Version wartet, bis es zu ist, sichert die alte als `*.alt`, kopiert sich in den Programmordner und startet. Geht dabei etwas schief (z. B. eine Datei ist gesperrt), stellt sie die alte Version wieder her und startet diese.
 - `*.alt` und `_update` werden beim nächsten Start aufgeräumt.
 - **Umstellung von der Einzel-exe (bis 1.0.6):** Diese Versionen aktualisieren sich zunächst auf die neue Einzel-exe. Die bietet dann „Schnellere Programmversion verfügbar“ an und stellt auf die Ordner-Variante um, im selben Ordner.
