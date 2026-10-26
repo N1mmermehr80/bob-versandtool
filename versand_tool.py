@@ -398,14 +398,14 @@ def read_export(path, default_weight):
             o.hints.append(f"{len(o.discounts)} Rabatt-/Gutscheinzeile(n) nicht ins Paket übernommen")
         valid = [i for i in o.items if i["weight"] and i["weight"] >= PLACEHOLDER_WEIGHT_KG]
         total = sum(i["weight"] * i["qty"] for i in valid)
-        if order_weight.get(ref):
-            o.weight, o.weight_source = order_weight[ref], "Export"
-        elif o.items and len(valid) == len(o.items):
-            o.weight, o.weight_source = round(total, 3), "Export"
+        # ORDER WEIGHT ist die Summe der Artikelgewichte – fehlt eins, ist es zu niedrig
+        if o.items and len(valid) == len(o.items):
+            o.weight, o.weight_source = order_weight.get(ref) or round(total, 3), "Export"
         else:
-            o.weight, o.weight_source = max(round(total, 3), default_weight), "Standard"
-            o.weight_estimated = True
-            o.hints.append(f"Gewicht nicht gepflegt, {o.weight:.2f} kg angesetzt".replace(".", ","))
+            o.weight = max(order_weight.get(ref) or 0.0, round(total, 3), default_weight)
+            o.weight_source, o.weight_estimated = "Standard", True
+            part = f" ({len(o.items) - len(valid)} von {len(o.items)} Artikeln)" if valid else ""
+            o.hints.append(f"Gewicht nicht gepflegt{part}, {o.weight:.2f} kg angesetzt".replace(".", ","))
             if len(o.items) == 1 and o.items[0]["qty"] == 1 and WHEELSET_RX.search(o.items[0]["name"]):
                 o.parcels, o.weight, o.weight_source = 4, 20.0, "Regel"
                 o.hints[-1] = "Radsatz erkannt: 4 Pakete à 20 kg angesetzt – bitte prüfen"

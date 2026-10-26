@@ -81,7 +81,7 @@ Ohne Server und ohne Adminrechte: Die Liste liegt in einem **Netzwerkordner**, a
 
 Das Gewicht wird in dieser Reihenfolge bestimmt:
 
-1. Gewicht aus dem Export, sofern gepflegt. Artikelgewichte unter 50 g gelten als Platzhalter.
+1. Gewicht aus dem Export, sofern bei allen Artikeln gepflegt. Artikelgewichte unter 50 g gelten als Platzhalter. Fehlt ein Artikelgewicht, ist das Auftragsgewicht (`ORDER WEIGHT`) zu niedrig und wird nur noch als Untergrenze genutzt.
 2. Erfahrungswert aus früheren Sendcloud-Sendungen desselben Artikels (letzte 120 Tage). Er wird nur übernommen, wenn er schwerer als das Standardgewicht ist oder mehrere Pakete ergibt.
 3. Radsätze (Kompletträder, WKR, Reifengröße im Namen): 4 Pakete à 20 kg.
 4. Sonst das Standardgewicht von 2,01 kg (in den Einstellungen änderbar).
