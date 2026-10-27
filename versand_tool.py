@@ -756,16 +756,41 @@ class S4T:
                 return orders
             page += 1
 
+    def order(self, order_id):
+        resp = self._call("fetchOrders", '<request method="fetchOrders" version="1.0.0"><filter>'
+                                         f'<order_ids filter_method="IN"><filter_values><filter_value>{int(order_id)}'
+                                         '</filter_value></filter_values></order_ids></filter>'
+                                         '<use_modification_context_filter>false</use_modification_context_filter></request>')
+        return resp.find("order")
+
     def report_shipped(self, o: Order):
-        """Versand mit Sendungsnummer(n) melden – S4T setzt den Status im passenden Workflow auf versendet."""
+        """Versand mit Sendungsnummer(n) melden – S4T setzt den Status im passenden Workflow auf versendet.
+        Bei Shop-Aufträgen übernimmt S4T teils nur die Sendungsnummer und lässt den Status stehen – deshalb wird
+        danach nachgelesen. Rückgabe: Warnungen von S4T."""
+        open_status = str(int(self.cfg["s4t_status_id"] or 130))
+        before = self.order(o.s4t_id)
+        if before is not None and before.findtext("order_status/order_status_id") != open_status:
+            return []  # schon weitergesetzt (z. B. von Hand in CONNECT) – erneutes SHIPPED liefert sonst Fehler -9
+        # bereits eingetragene Sendungsnummern nicht noch einmal senden, S4T legte sonst weitere Pakete an
+        known = {(t.text or "").strip() for t in before.iter("tracking_number")} if before is not None else set()
         infos = "".join(f"<shipping_information><tracking_number>{xml_escape(t)}</tracking_number>"
                         "<shipping_provider_identifier>DHL</shipping_provider_identifier>"
                         f"<shipping_date>{dt.datetime.now():%Y-%m-%dT%H:%M:%S}</shipping_date></shipping_information>"
-                        for t in o.tracking.split(", ") if t)
-        self._call("updateOrderStatus",
-                   f'<request method="updateOrderStatus" version="1.0.0"><order significant_key="order_id">'
-                   f'<mandator_id>{int(self.cfg["s4t_mandator"] or 1)}</mandator_id><order_id>{int(o.s4t_id)}</order_id>'
-                   f'<status>SHIPPED</status><shipping_informations>{infos}</shipping_informations></order></request>')
+                        for t in o.tracking.split(", ") if t and t not in known)
+        resp = self._call("updateOrderStatus",
+                          f'<request method="updateOrderStatus" version="1.0.0"><order significant_key="order_id">'
+                          f'<mandator_id>{int(self.cfg["s4t_mandator"] or 1)}</mandator_id><order_id>{int(o.s4t_id)}</order_id>'
+                          '<status>SHIPPED</status>'
+                          + (f'<shipping_informations>{infos}</shipping_informations>' if infos else '')
+                          + '</order></request>')
+        warnings = [w.text.strip() for w in resp.iter("warning_message") if (w.text or "").strip()]
+        after = self.order(o.s4t_id)
+        if after is not None and after.findtext("order_status/order_status_id") == open_status:
+            name = after.findtext("order_status/order_status_identifier") or ""
+            raise S4TError(f"Sendungsnummer ist eingetragen, der Auftrag steht aber weiter auf {open_status} „{name}“ "
+                           "statt versendet. Bitte in CONNECT auf versendet setzen"
+                           + (f" (S4T: {'; '.join(warnings)})" if warnings else ""))
+        return warnings
 
 
 def s4t_order(x, default_weight):
@@ -2381,10 +2406,10 @@ class App(tk.Tk):
     def _report_s4t(self, o):
         """Versand mit Sendungsnummer an Speed4Trade melden. Fehler werden am Auftrag vermerkt, nicht geworfen."""
         try:
-            S4T(self.cfg).report_shipped(o)
+            warnings = S4T(self.cfg).report_shipped(o)
             o.s4t_reported, o.s4t_error = dt.datetime.now().isoformat(timespec="minutes"), ""
             o.exported = True  # Sendungsnummer ist in Speed4Trade – kein CSV-Export mehr nötig
-            append_log(o, "Versand an Speed4Trade gemeldet")
+            append_log(o, "Versand an Speed4Trade gemeldet" + (f" (Hinweis: {'; '.join(warnings)})" if warnings else ""))
             return True
         except Exception as e:
             o.s4t_error = str(e)
