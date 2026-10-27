@@ -37,7 +37,6 @@ UPDATE_ASSET = "BOB-Sendcloud-Versand.exe"
 APP_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "BOB-Sendcloud-Versand")
 CONFIG_PATH = os.path.join(APP_DIR, "config.ini")
 LOG_PATH = os.path.join(APP_DIR, "sendungen_log.csv")
-HISTORY_PATH = os.path.join(APP_DIR, "erfahrungswerte.json")
 SESSION_PATH = os.path.join(APP_DIR, "arbeitsliste.json")
 LABEL_DIR = os.path.join(APP_DIR, "labels")
 PRINT_DIR = os.path.join(APP_DIR, "sammeldruck")
@@ -528,6 +527,91 @@ def apply_history(orders, history, default_weight=2.01):
     return changed
 
 
+def weight_stats(obs, recent=10):
+    """Erfahrungswerte je SKU aus Einzelwerten {"Auftrag|SKU": {"parcels", "weight", "ts"}}: häufigste
+    Paketanzahl und dazu häufigstes Gewicht der letzten `recent` Aufträge (neue Verpackung schlägt schnell durch)."""
+    per_sku = {}
+    for key, x in obs.items():
+        per_sku.setdefault(key.split("|", 1)[-1], []).append(x)
+    result = {}
+    for sku, lst in per_sku.items():
+        lst = sorted(lst, key=lambda x: x.get("ts", 0))[-recent:]
+        ns = [x["parcels"] for x in lst]
+        parcels = max(set(ns), key=ns.count)
+        ws = [x["weight"] for x in lst if x["parcels"] == parcels]
+        result[sku] = {"parcels": parcels, "weight": max(set(ws), key=ws.count), "count": len(lst)}
+    return result
+
+
+class WeightStore:
+    """Eigene Ablage der versendeten Gewichte (Ordner „gewichte“), damit die Erfahrungswerte nicht an
+    Sendcloud hängen. Jeder Arbeitsplatz schreibt nur seine eigene Datei (keine Konflikte im gemeinsamen
+    Ordner), der Sendcloud-Import liegt in sendcloud.json. Gelesen werden alle Dateien zusammen."""
+    SENDCLOUD = "sendcloud.json"
+
+    def __init__(self, root, user):
+        self.dir = os.path.join(root, "gewichte")
+        self.own = os.path.join(self.dir, re.sub(r"[^\w.-]", "_", user) + ".json")
+
+    def _read(self, path):
+        for attempt in range(5):  # Datei kann gerade ersetzt werden
+            try:
+                with open(path, encoding="utf-8") as f:
+                    return json.load(f)
+            except FileNotFoundError:
+                return {}
+            except (json.JSONDecodeError, PermissionError):
+                time.sleep(0.1)
+        raise OSError(f"Datei nicht lesbar: {path}")
+
+    def _write(self, path, obs):
+        os.makedirs(self.dir, exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obs, f, ensure_ascii=False)
+        for attempt in range(20):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:  # Ziel wird gerade von einem anderen Platz gelesen
+                time.sleep(0.1)
+        os.remove(tmp)
+        raise OSError(f"Datei nicht schreibbar: {path}")
+
+    def load(self):
+        obs = {}
+        try:
+            names = sorted(n for n in os.listdir(self.dir) if n.endswith(".json"))
+        except FileNotFoundError:
+            return obs
+        for n in names:  # sendcloud.json zuerst, eigene Werte überschreiben gleiche Aufträge
+            if n == self.SENDCLOUD:
+                obs = {**self._read(os.path.join(self.dir, n)), **obs}
+            else:
+                obs.update(self._read(os.path.join(self.dir, n)))
+        return obs
+
+    def sendcloud_age(self):
+        try:
+            return time.time() - os.path.getmtime(os.path.join(self.dir, self.SENDCLOUD))
+        except OSError:
+            return None
+
+    def put_sendcloud(self, obs):
+        """Sendcloud-Werte ergänzen – ältere Einträge bleiben, auch wenn Sendcloud sie nicht mehr liefert."""
+        path = os.path.join(self.dir, self.SENDCLOUD)
+        self._write(path, {**self._read(path), **obs})
+
+    def add(self, o):
+        """Versendetes Gewicht merken, wenn der Auftrag nur einen Artikel (SKU) enthält."""
+        skus = {(i["sku"] or "").upper() for i in o.items}
+        if len(skus) != 1 or not next(iter(skus)) or not o.weight:
+            return
+        own = self._read(self.own)
+        own[f"{o.ref}|{skus.pop()}"] = {"parcels": o.parcels, "weight": round(o.weight, 3), "ts": int(time.time())}
+        self._write(self.own, own)
+
+
 # --------------------------------------------------------------------------- Sendcloud
 
 class SendcloudError(Exception):
@@ -590,7 +674,7 @@ class Sendcloud:
         return found
 
     def history(self, days=120, progress=None):
-        """Erfahrungswerte je SKU aus den Sendungen der letzten `days` Tage."""
+        """Gewichte je Auftrag und SKU aus den Sendungen der letzten `days` Tage (Format wie WeightStore)."""
         since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
         url = API_BASE + "/shipments?" + urllib.parse.urlencode({"updated_after": since, "page_size": 100})
         per_order = {}
@@ -614,21 +698,20 @@ class Sendcloud:
                         continue
                     w = _num((p.get("weight") or {}).get("value"))
                     if w:
-                        per_order.setdefault((str(x.get("order_number")), skus.pop()), []).append(w)
+                        rec = per_order.setdefault(f"{x.get('order_number')}|{skus.pop()}", {"w": [], "ts": 0})
+                        rec["w"].append(w)
+                        try:
+                            ts = dt.datetime.fromisoformat(p["created_at"].replace("Z", "+00:00")).timestamp()
+                        except Exception:
+                            ts = 0
+                        rec["ts"] = max(rec["ts"], int(ts))
             m = re.search(r'<([^>]+)>;\s*rel="?next"?', link)
             url = m.group(1) if m else None
             pages += 1
             if progress:
                 progress(pages)
-        stats = {}
-        for (_, sku), weights in per_order.items():
-            stats.setdefault(sku, []).append((len(weights), max(set(weights), key=weights.count)))
-        result = {}
-        for sku, lst in stats.items():
-            parcels = max(set(n for n, _ in lst), key=[n for n, _ in lst].count)
-            ws = [w for n, w in lst if n == parcels]
-            result[sku] = {"parcels": parcels, "weight": max(set(ws), key=ws.count), "count": len(lst)}
-        return result
+        return {k: {"parcels": len(r["w"]), "weight": max(set(r["w"]), key=r["w"].count), "ts": r["ts"]}
+                for k, r in per_order.items()}
 
     def announce(self, o: Order):
         """Legt eine Sendung (ein Paket) an. Bei mehreren Paketen wird die Methode je Paket aufgerufen."""
@@ -1735,6 +1818,8 @@ class App(tk.Tk):
         if BACKEND is not None:
             self.after(3000, self._sync_tick)
         self.after(5000, self._update_tick)
+        if self.cfg["use_history"] == "1":
+            self.after(8000, self._apply_history_cached)  # Erfahrungswerte laden, Sendcloud-Import ergänzen
         self._s4t_running = False
         self.after(3000, self._s4t_tick)
         if self.cfg.carrier_missing:
@@ -2487,10 +2572,10 @@ class App(tk.Tk):
             finished = self._cleanup_finished(refresh=False)
             if self.cfg["use_history"] == "1":  # Erfahrungswerte vor dem Teilen anwenden
                 try:
-                    cache = json.load(open(HISTORY_PATH, encoding="utf-8"))
-                    apply_history(fresh, cache.get("data", {}), _num(self.cfg["default_weight_kg"]) or 2.01)
-                except Exception:
+                    self.hist = self.hist or weight_stats(self.weights.load())
+                except OSError:
                     pass
+                apply_history(fresh, self.hist, _num(self.cfg["default_weight_kg"]) or 2.01)
             for o in fresh:
                 res[BACKEND.add(shared_data(o))] += 1
             records, hidden = BACKEND.load_all()
@@ -2523,17 +2608,23 @@ class App(tk.Tk):
         return res["added"]
 
     # ----- Erfahrungswerte aus früheren Sendungen
+    hist = {}  # Erfahrungswerte je SKU (aus WeightStore berechnet)
+
+    @property
+    def weights(self):
+        return WeightStore(BACKEND.root if BACKEND is not None else APP_DIR, USER)
+
     def _apply_history_cached(self):
-        """Cache sofort anwenden; ist er älter als 12 h, im Hintergrund neu laden."""
-        cache = {}
+        """Gespeicherte Gewichte sofort anwenden; Sendcloud-Werte älter als 12 h im Hintergrund ergänzen,
+        solange noch Sendcloud-Zugangsdaten eingetragen sind."""
+        store = self.weights
         try:
-            cache = json.load(open(HISTORY_PATH, encoding="utf-8"))
-        except Exception:
+            self.hist = weight_stats(store.load())
+        except OSError:
             pass
-        if cache.get("data"):
-            apply_history(self.orders, cache["data"], _num(self.cfg["default_weight_kg"]) or 2.01)
-        age = time.time() - cache.get("ts", 0)
-        if age > 12 * 3600 and self.cfg.public_key and not self.busy:
+        apply_history(self.orders, self.hist, _num(self.cfg["default_weight_kg"]) or 2.01)
+        age = store.sendcloud_age()
+        if (age is None or age > 12 * 3600) and self.cfg.public_key and not self.busy:
             self.reload_history()
 
     def reload_history(self, notify=False):
@@ -2542,18 +2633,22 @@ class App(tk.Tk):
         self.busy = True
         for b in (self.btn_send, self.btn_open, self.btn_export, self.btn_s4t):
             b.state(["disabled"])
-        self.status.set("Lade Erfahrungswerte (Gewicht/Pakete) aus früheren Sendcloud-Sendungen…")
+        self.status.set("Lade Erfahrungswerte (Gewicht/Pakete) aus früheren Sendungen…")
         self.progress.configure(mode="indeterminate")
         self.progress.start(15)
 
         def run():
+            store, sc_error = self.weights, None
             try:
-                data = Sendcloud(self.cfg).history()
-                os.makedirs(APP_DIR, exist_ok=True)
-                json.dump({"ts": time.time(), "data": data}, open(HISTORY_PATH, "w", encoding="utf-8"))
-                self.q.put(("history", (data, notify)))
+                if self.cfg.public_key:  # Sendcloud ergänzen; erster Import holt 3 Jahre
+                    try:
+                        store.put_sendcloud(Sendcloud(self.cfg).history(
+                            days=120 if store.sendcloud_age() is not None else 3 * 365))
+                    except SendcloudError as e:
+                        sc_error = e  # gespeicherte Werte gelten trotzdem
+                self.q.put(("history", (weight_stats(store.load()), notify, sc_error)))
             except Exception as e:
-                self.q.put(("history", (e, notify)))
+                self.q.put(("history", (e, notify, None)))
         threading.Thread(target=run, daemon=True).start()
 
     def edit_current(self):
@@ -2721,6 +2816,10 @@ class App(tk.Tk):
                         if tracks:
                             append_log(o, f"Label erstellt ({len(tracks)} von {o.parcels} Paketen)")
                     o.status = "Label erstellt"
+                    try:
+                        self.weights.add(o)  # eigene Erfahrungswerte, unabhängig vom Versandweg
+                    except OSError:
+                        pass
                 o.selected = False
                 if o.s4t_id and self.cfg["s4t_report"] == "1" and not o.s4t_reported:
                     self._report_s4t(o)
@@ -2775,7 +2874,7 @@ class App(tk.Tk):
                     if self._update_finished(*val):
                         return  # Fenster ist zu, kein weiteres after()
                 elif kind == "history":
-                    data, notify = val
+                    data, notify, sc_error = val
                     self.busy = False
                     for b in (self.btn_send, self.btn_open, self.btn_export, self.btn_s4t):
                         b.state(["!disabled"])
@@ -2786,14 +2885,16 @@ class App(tk.Tk):
                         if notify:
                             messagebox.showerror(APP_NAME, f"Erfahrungswerte konnten nicht geladen werden:\n{data}")
                     else:
+                        self.hist = data
                         n = apply_history(self.orders, data, _num(self.cfg["default_weight_kg"]) or 2.01) if self.cfg["use_history"] == "1" else 0
                         self.save_session()
                         self.refresh()
                         self._show_details()
-                        self._update_status(f"Erfahrungswerte: {len(data)} Artikel bekannt, {n} Aufträge angepasst.")
+                        note = f" Sendcloud nicht erreichbar ({sc_error}), gespeicherte Werte genutzt." if sc_error else ""
+                        self._update_status(f"Erfahrungswerte: {len(data)} Artikel bekannt, {n} Aufträge angepasst.{note}")
                         if notify:
                             messagebox.showinfo(APP_NAME, f"Erfahrungswerte für {len(data)} Artikel geladen.\n"
-                                                          f"{n} Aufträge der aktuellen Liste angepasst.")
+                                                          f"{n} Aufträge der aktuellen Liste angepasst." + note)
                 elif kind == "progress":
                     self.progress.configure(value=val)
                     self._update_status()

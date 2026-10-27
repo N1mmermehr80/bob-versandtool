@@ -102,7 +102,9 @@ Ohne Server und ohne Adminrechte: Die Liste liegt in einem **Netzwerkordner**, a
 Das Gewicht wird in dieser Reihenfolge bestimmt:
 
 1. Gewicht aus dem Export, sofern bei allen Artikeln gepflegt. Artikelgewichte unter 50 g gelten als Platzhalter. Fehlt ein Artikelgewicht, ist das Auftragsgewicht (`ORDER WEIGHT`) zu niedrig und wird nur noch als Untergrenze genutzt.
-2. Erfahrungswert aus früheren Sendcloud-Sendungen desselben Artikels (letzte 120 Tage). Er wird nur übernommen, wenn er schwerer als das Standardgewicht ist oder mehrere Pakete ergibt.
+2. Erfahrungswert aus früheren Sendungen desselben Artikels (häufigster Wert der letzten 10 Aufträge). Er wird nur übernommen, wenn er schwerer als das Standardgewicht ist oder mehrere Pakete ergibt.
+   - Das Tool speichert nach jedem Label Paketanzahl und Gewicht von Aufträgen mit nur einem Artikel im Ordner `gewichte\` (im gemeinsamen Ordner, sonst unter `%APPDATA%`). Jeder Arbeitsplatz schreibt eine eigene Datei. Das gilt für Sendcloud und DHL direkt.
+   - Solange Sendcloud-Schlüssel eingetragen sind, ergänzt das Tool höchstens alle 12 Stunden die Werte aus Sendcloud in `gewichte\sendcloud.json` (beim ersten Mal 3 Jahre). Die Datei bleibt erhalten, auch wenn Sendcloud nicht mehr erreichbar ist.
 3. Radsätze (Kompletträder, WKR, Reifengröße im Namen): 4 Pakete à 20 kg.
 4. Sonst das Standardgewicht von 2,01 kg (in den Einstellungen änderbar).
 
@@ -116,7 +118,7 @@ Bei mehreren Paketen wird je Paket eine eigene Sendung mit derselben Auftragsnum
   - Arbeitsliste (`arbeitsliste.json`)
   - Label-PDFs (`labels\`) und Sammeldrucke (`sammeldruck\`)
   - Protokoll aller Sendungen (`sendungen_log.csv`)
-  - Erfahrungswerte
+  - Erfahrungswerte (`gewichte\`, ohne gemeinsamen Ordner)
 - **Zugangsdaten:** Die Sendcloud-Schlüssel und das Speed4Trade-Passwort werden mit Windows-DPAPI verschlüsselt gespeichert und sind nur für den eigenen Windows-Benutzer lesbar. Beim ersten Start werden sie aus einer `.env` neben der exe übernommen, falls vorhanden.
 
 ## Updates und neue Versionen (GitHub)
