@@ -221,7 +221,7 @@ class Config:
         """Fehlende Zugangsdaten für den eingestellten Versandweg (leer = bereit)."""
         if self["carrier"] != "dhl":
             return [] if self.public_key and self.secret_key else ["Sendcloud-Zugangsdaten"]
-        miss = [n for v, n in ((self.dhl_api_key, "DHL API-Key"), (self.dhl_api_secret, "DHL API-Secret")) if not v]
+        miss = [] if self.dhl_api_key else ["DHL API-Key"]
         if self["dhl_sandbox"] != "1":
             miss += [n for v, n in ((self["dhl_user"].strip(), "DHL GKP-Benutzer"), (self.dhl_password, "DHL Passwort"),
                                     (re.fullmatch(r"\w{10}\d{2}\w{2}", self["dhl_billing"].strip()),
@@ -707,7 +707,6 @@ class DHLError(SendcloudError):
 class DHL:
     """Labels direkt bei DHL (Geschäftskundenvertrag), nur DHL Paket national (V01PAK).
     Gleiche Schnittstelle wie Sendcloud: test, existing, announce, label_pdf."""
-    _tokens = {}  # (Umgebung, Benutzer) -> (Token, gültig bis); Token gilt 30 min
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -715,33 +714,14 @@ class DHL:
         self.base = DHL_API[self.sandbox]
         self.user, self.password, self.billing = DHL_SANDBOX_LOGIN if self.sandbox else \
             (cfg["dhl_user"].strip(), cfg.dhl_password, cfg["dhl_billing"].strip())
+        # API-Key + GKP-Benutzer per Basic Auth; ein OAuth-Token wird für /orders abgelehnt („no apiproduct match“)
+        self._basic = base64.b64encode(f"{self.user}:{self.password}".encode()).decode()
         self._pdfs = {}  # Labels aus der Anlage-Antwort, spart den zweiten Abruf
-
-    def _token(self):
-        key = (self.sandbox, self.user)
-        tok, until = DHL._tokens.get(key, ("", 0))
-        if tok and time.time() < until:
-            return tok
-        body = urllib.parse.urlencode({"grant_type": "password", "username": self.user, "password": self.password,
-                                       "client_id": self.cfg.dhl_api_key, "client_secret": self.cfg.dhl_api_secret})
-        req = urllib.request.Request(self.base + "/parcel/de/account/auth/ropc/v1/token", data=body.encode(),
-                                     method="POST", headers={"Content-Type": "application/x-www-form-urlencoded",
-                                                             "Accept": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=60) as r:
-                d = json.loads(r.read())
-        except urllib.error.HTTPError as e:
-            raise DHLError(f"DHL-Anmeldung abgelehnt (HTTP {e.code}) – API-Key/Secret und GKP-Benutzer/Passwort prüfen")
-        except urllib.error.URLError as e:
-            raise DHLError(f"Keine Verbindung zu DHL: {e.reason}")
-        tok = d["access_token"]
-        DHL._tokens[key] = (tok, time.time() + int(d.get("expires_in") or 1800) - 60)
-        return tok
 
     def _call(self, method, path, body=None):
         req = urllib.request.Request(self.base + "/parcel/de/shipping/v2" + path, method=method,
                                      data=json.dumps(body).encode() if body is not None else None,
-                                     headers={"Authorization": "Bearer " + self._token(),
+                                     headers={"Authorization": "Basic " + self._basic,
                                               "dhl-api-key": self.cfg.dhl_api_key, "Accept": "application/json",
                                               "Accept-Language": "de-DE", "Content-Type": "application/json"})
         for attempt in range(3):
@@ -753,8 +733,12 @@ class DHL:
                     time.sleep(5 * (attempt + 1))
                     continue
                 if e.code == 401:
-                    DHL._tokens.pop((self.sandbox, self.user), None)
-                    raise DHLError("DHL hat die Anmeldung abgelehnt (HTTP 401) – Zugangsdaten prüfen")
+                    try:
+                        detail = json.loads(e.read()).get("detail") or ""
+                    except Exception:
+                        detail = ""
+                    hint = " – der API-Key ist für die Testumgebung nicht freigeschaltet"                         if self.sandbox and "ApiKey" in detail else " – API-Key, GKP-Benutzer und Passwort prüfen"
+                    raise DHLError(f"DHL hat die Anmeldung abgelehnt (HTTP 401{': ' + detail if detail else ''}){hint}")
                 raw = e.read().decode(errors="replace")
                 try:
                     msg = self._errors(json.loads(raw))
@@ -827,7 +811,9 @@ class DHL:
             raise DHLError(f"{o.weight:.2f} kg je Paket – DHL Paket erlaubt höchstens 31,5 kg")
         return {"product": "V01PAK", "billingNumber": self.billing, "refNo": f"Auftrag {o.ref}"[:35],
                 "shipper": self._shipper(), "consignee": self.consignee(o),
-                "details": {"weight": {"uom": "kg", "value": round(max(o.weight, 0.01), 3)}}}
+                "details": {"weight": {"uom": "kg", "value": round(max(o.weight, 0.01), 3)}},
+                # bucht DHL bei manchen Verträgen ohnehin automatisch hinzu – ohne Angabe scheitert die Sendung am Hinweis
+                **({} if self.sandbox else {"services": {"goGreenPlus": True}})}
 
     def _query(self, **extra):
         q = {"printFormat": self.cfg["dhl_print_format"] or "910-300-300", "includeDocs": "include", **extra}
@@ -4134,7 +4120,7 @@ class DHLDialog(tk.Toplevel):
                   foreground=C["muted"], wraplength=470).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
         self.key, self.secret, self.pw = (tk.StringVar(value=v) for v in
                                           (cfg.dhl_api_key, cfg.dhl_api_secret, cfg.dhl_password))
-        rows = [("API-Key", self.key, ""), ("API-Secret", self.secret, "•")]
+        rows = [("API-Key", self.key, ""), ("API-Secret (optional)", self.secret, "•")]
         self.vars = {k: tk.StringVar(value=cfg[k]) for k, _ in self.FIELDS}
         rows += [(self.FIELDS[0][1], self.vars["dhl_user"], ""), ("Passwort", self.pw, "•"),
                  (self.FIELDS[1][1], self.vars["dhl_billing"], ""), (self.FIELDS[2][1], self.vars["dhl_profile"], "")]
