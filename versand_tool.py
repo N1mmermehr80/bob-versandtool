@@ -765,8 +765,8 @@ class S4T:
 
     def report_shipped(self, o: Order):
         """Versand mit Sendungsnummer(n) melden – S4T setzt den Status im passenden Workflow auf versendet.
-        Bei Shop-Aufträgen übernimmt S4T teils nur die Sendungsnummer und lässt den Status stehen – deshalb wird
-        danach nachgelesen. Rückgabe: Warnungen von S4T."""
+        Bei Shop-Aufträgen (COMMERCE) übernimmt S4T mit den Paketdaten nur die Sendungsnummer und lässt den Status
+        stehen; erst ein zweites SHIPPED ohne Paketdaten setzt ihn. Deshalb wird nachgelesen. Rückgabe: Warnungen."""
         open_status = str(int(self.cfg["s4t_status_id"] or 130))
         before = self.order(o.s4t_id)
         if before is not None and before.findtext("order_status/order_status_id") != open_status:
@@ -777,14 +777,19 @@ class S4T:
                         "<shipping_provider_identifier>DHL</shipping_provider_identifier>"
                         f"<shipping_date>{dt.datetime.now():%Y-%m-%dT%H:%M:%S}</shipping_date></shipping_information>"
                         for t in o.tracking.split(", ") if t and t not in known)
-        resp = self._call("updateOrderStatus",
-                          f'<request method="updateOrderStatus" version="1.0.0"><order significant_key="order_id">'
-                          f'<mandator_id>{int(self.cfg["s4t_mandator"] or 1)}</mandator_id><order_id>{int(o.s4t_id)}</order_id>'
-                          '<status>SHIPPED</status>'
-                          + (f'<shipping_informations>{infos}</shipping_informations>' if infos else '')
-                          + '</order></request>')
-        warnings = [w.text.strip() for w in resp.iter("warning_message") if (w.text or "").strip()]
+        def shipped(infos=""):
+            resp = self._call("updateOrderStatus",
+                              f'<request method="updateOrderStatus" version="1.0.0"><order significant_key="order_id">'
+                              f'<mandator_id>{int(self.cfg["s4t_mandator"] or 1)}</mandator_id>'
+                              f'<order_id>{int(o.s4t_id)}</order_id><status>SHIPPED</status>'
+                              + (f'<shipping_informations>{infos}</shipping_informations>' if infos else '')
+                              + '</order></request>')
+            return [w.text.strip() for w in resp.iter("warning_message") if (w.text or "").strip()]
+        warnings = shipped(infos)
         after = self.order(o.s4t_id)
+        if infos and after is not None and after.findtext("order_status/order_status_id") == open_status:
+            warnings += shipped()
+            after = self.order(o.s4t_id)
         if after is not None and after.findtext("order_status/order_status_id") == open_status:
             name = after.findtext("order_status/order_status_identifier") or ""
             raise S4TError(f"Sendungsnummer ist eingetragen, der Auftrag steht aber weiter auf {open_status} „{name}“ "
