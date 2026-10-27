@@ -89,7 +89,7 @@ DEFAULTS = {
     "dhl_user": "",            # GKP-Benutzer (Systembenutzer), Passwort/API-Key/Secret verschlüsselt pro PC
     "dhl_billing": "",         # 14-stellige Abrechnungsnummer DHL Paket (EKP + 01 + Teilnahme)
     "dhl_profile": "STANDARD_GRUPPENPROFIL",
-    "dhl_print_format": "910-300-300-oz",  # 105 × 148 mm = A6, oz = ohne Zusatzetiketten
+    "dhl_print_format": "910-300-400",  # 100 × 150 mm, Thermodruck (Zebra), randlos
 }
 
 # Diese Einstellungen gelten für alle Arbeitsplätze (im gemeinsamen Ordner); Zugangsdaten bleiben pro PC.
@@ -816,7 +816,7 @@ class DHL:
                 **({} if self.sandbox else {"services": {"goGreenPlus": True}})}
 
     def _query(self, **extra):
-        q = {"printFormat": self.cfg["dhl_print_format"] or "910-300-300-oz", "includeDocs": "include", **extra}
+        q = {"printFormat": self.cfg["dhl_print_format"] or "910-300-400", "includeDocs": "include", **extra}
         return "?" + urllib.parse.urlencode(q)
 
     def test(self):
@@ -2609,7 +2609,7 @@ class App(tk.Tk):
             return
         high = [o for o in sel if o.value / o.parcels > 500]
         n_parcels = sum(o.parcels for o in sel)
-        via = ("direkt bei DHL" + (" (TESTUMGEBUNG)" if self.cfg["dhl_sandbox"] == "1" else "")) if dhl else             "bei Sendcloud"
+        via = ("direkt bei DHL" + (" (TESTUMGEBUNG)" if self.cfg["dhl_sandbox"] == "1" else "")) if dhl else "bei Sendcloud"
         msg = (f"{len(sel)} Auftrag/Aufträge mit insgesamt {n_parcels} Paket(en) {via} anlegen und bei DHL "
                f"anmelden?\n\nGesamtgewicht {sum(o.weight * o.parcels for o in sel):.2f} kg. "
                f"Die Labels sind kostenpflichtig.").replace(".", ",", 1)
@@ -2732,7 +2732,7 @@ class App(tk.Tk):
             o.locked_by = o.locked_at = ""  # Reservierung freigeben (wird mit dem Ergebnis gespeichert)
             self.q.put(("row", i))
             self.q.put(("progress", n))
-        self.q.put(("done", None))
+        self.q.put(("done", sel))
 
     def _poll(self):
         try:
@@ -2802,11 +2802,12 @@ class App(tk.Tk):
                     for b in (self.btn_send, self.btn_open, self.btn_export, self.btn_s4t):
                         b.state(["!disabled"])
                     self.save_session()
-                    ok = sum(o.status == "Label erstellt" for o in self.orders)
-                    ex = sum(o.status == "bereits vorhanden" for o in self.orders)
-                    err = [o for o in self.orders if o.status in ("Fehler", "teilweise")]
-                    skipped = [o for o in self.orders if o.local_msg]
-                    s4t_bad = [o for o in self.orders if o.s4t_error and o.tracking and not o.s4t_reported]
+                    run = val  # nur die Aufträge dieses Durchlaufs zählen, nicht ältere Ergebnisse in der Liste
+                    ok = sum(o.status == "Label erstellt" for o in run)
+                    ex = sum(o.status == "bereits vorhanden" for o in run)
+                    err = [o for o in run if o.status in ("Fehler", "teilweise")]
+                    skipped = [o for o in run if o.local_msg]
+                    s4t_bad = [o for o in run if o.s4t_error and o.tracking and not o.s4t_reported]
                     self._update_status()
                     messagebox.showinfo(APP_NAME, f"Fertig.\n\nLabels erstellt: {ok}\nBereits vorhanden: {ex}\n"
                                                   f"Fehler: {len(err)}" + ("\n\n" + "\n".join(
@@ -4104,7 +4105,7 @@ class S4TDialog(tk.Toplevel):
 class DHLDialog(tk.Toplevel):
     FIELDS = [("dhl_user", "GKP-Benutzer"), ("dhl_billing", "Abrechnungsnummer DHL Paket"),
               ("dhl_profile", "Gruppenprofil")]
-    PRINT_FORMATS = ("910-300-300-oz", "910-300-300", "910-300-400", "910-300-600", "910-300-700-oz", "910-300-700", "A4")
+    PRINT_FORMATS = ("910-300-400", "910-300-300-oz", "910-300-300", "910-300-600", "910-300-700-oz", "910-300-700", "A4")
 
     def __init__(self, master, cfg: Config):
         super().__init__(master)
@@ -4129,10 +4130,11 @@ class DHLDialog(tk.Toplevel):
             ttk.Entry(f, textvariable=var, width=40, show=show).grid(row=r, column=1, sticky="w", padx=(8, 0))
         r = len(rows) + 1
         ttk.Label(f, text="Labelformat").grid(row=r, column=0, sticky="w", pady=2)
-        self.fmt = tk.StringVar(value=cfg["dhl_print_format"] or "910-300-300-oz")
+        self.fmt = tk.StringVar(value=cfg["dhl_print_format"] or "910-300-400")
         ttk.Combobox(f, textvariable=self.fmt, values=self.PRINT_FORMATS, width=14, state="readonly").grid(
             row=r, column=1, sticky="w", padx=(8, 0))
-        ttk.Label(f, text="910-300-300 = 105 × 148 mm (A6), „-oz“ = ohne Zusatzetiketten (Abziehcodes)", foreground=C["muted"]).grid(
+        ttk.Label(f, text="910-300-400 = 100 × 150 mm für Etikettendrucker (Zebra)\n"
+                          "910-300-300 = A6 für Laserdrucker, „-oz“ = ohne Abziehcodes", foreground=C["muted"]).grid(
             row=r + 1, column=1, sticky="w", padx=(8, 0))
         self.sandbox = tk.BooleanVar(value=cfg["dhl_sandbox"] == "1")
         ttk.Checkbutton(f, text="Testumgebung (Sandbox) – keine echten Labels, nur API-Key nötig",
