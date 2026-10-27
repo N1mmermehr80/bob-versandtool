@@ -89,7 +89,7 @@ DEFAULTS = {
     "dhl_user": "",            # GKP-Benutzer (Systembenutzer), Passwort/API-Key/Secret verschlüsselt pro PC
     "dhl_billing": "",         # 14-stellige Abrechnungsnummer DHL Paket (EKP + 01 + Teilnahme)
     "dhl_profile": "STANDARD_GRUPPENPROFIL",
-    "dhl_print_format": "910-300-300",  # 105 × 148 mm = A6
+    "dhl_print_format": "910-300-300-oz",  # 105 × 148 mm = A6, oz = ohne Zusatzetiketten
 }
 
 # Diese Einstellungen gelten für alle Arbeitsplätze (im gemeinsamen Ordner); Zugangsdaten bleiben pro PC.
@@ -816,7 +816,7 @@ class DHL:
                 **({} if self.sandbox else {"services": {"goGreenPlus": True}})}
 
     def _query(self, **extra):
-        q = {"printFormat": self.cfg["dhl_print_format"] or "910-300-300", "includeDocs": "include", **extra}
+        q = {"printFormat": self.cfg["dhl_print_format"] or "910-300-300-oz", "includeDocs": "include", **extra}
         return "?" + urllib.parse.urlencode(q)
 
     def test(self):
@@ -4104,7 +4104,7 @@ class S4TDialog(tk.Toplevel):
 class DHLDialog(tk.Toplevel):
     FIELDS = [("dhl_user", "GKP-Benutzer"), ("dhl_billing", "Abrechnungsnummer DHL Paket"),
               ("dhl_profile", "Gruppenprofil")]
-    PRINT_FORMATS = ("910-300-300", "910-300-400", "910-300-600", "910-300-700", "A4")
+    PRINT_FORMATS = ("910-300-300-oz", "910-300-300", "910-300-400", "910-300-600", "910-300-700-oz", "910-300-700", "A4")
 
     def __init__(self, master, cfg: Config):
         super().__init__(master)
@@ -4129,13 +4129,13 @@ class DHLDialog(tk.Toplevel):
             ttk.Entry(f, textvariable=var, width=40, show=show).grid(row=r, column=1, sticky="w", padx=(8, 0))
         r = len(rows) + 1
         ttk.Label(f, text="Labelformat").grid(row=r, column=0, sticky="w", pady=2)
-        self.fmt = tk.StringVar(value=cfg["dhl_print_format"] or "910-300-300")
+        self.fmt = tk.StringVar(value=cfg["dhl_print_format"] or "910-300-300-oz")
         ttk.Combobox(f, textvariable=self.fmt, values=self.PRINT_FORMATS, width=14, state="readonly").grid(
             row=r, column=1, sticky="w", padx=(8, 0))
-        ttk.Label(f, text="910-300-300 = 105 × 148 mm (A6)", foreground=C["muted"]).grid(
+        ttk.Label(f, text="910-300-300 = 105 × 148 mm (A6), „-oz“ = ohne Zusatzetiketten (Abziehcodes)", foreground=C["muted"]).grid(
             row=r + 1, column=1, sticky="w", padx=(8, 0))
         self.sandbox = tk.BooleanVar(value=cfg["dhl_sandbox"] == "1")
-        ttk.Checkbutton(f, text="Testumgebung (Sandbox) – keine echten Labels, nur API-Key/Secret nötig",
+        ttk.Checkbutton(f, text="Testumgebung (Sandbox) – keine echten Labels, nur API-Key nötig",
                         variable=self.sandbox).grid(row=r + 2, column=0, columnspan=2, sticky="w", pady=(8, 0))
         b = ttk.Frame(f)
         b.grid(row=r + 3, column=0, columnspan=2, sticky="e", pady=(12, 0))
