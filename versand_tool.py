@@ -83,13 +83,21 @@ DEFAULTS = {
     "s4t_status_id": "130",    # paid shipping
     "s4t_mandator": "1",
     "s4t_report": "1",         # Versand mit Sendungsnummer an S4T zurückmelden
+    # Versandweg: "sendcloud" oder "dhl" (direkt über den eigenen DHL-Geschäftskundenvertrag, nur national)
+    "carrier": "sendcloud",
+    "dhl_sandbox": "1",        # DHL-Testumgebung (keine echten, kostenpflichtigen Labels)
+    "dhl_user": "",            # GKP-Benutzer (Systembenutzer), Passwort/API-Key/Secret verschlüsselt pro PC
+    "dhl_billing": "",         # 14-stellige Abrechnungsnummer DHL Paket (EKP + 01 + Teilnahme)
+    "dhl_profile": "STANDARD_GRUPPENPROFIL",
+    "dhl_print_format": "910-300-300",  # 105 × 148 mm = A6
 }
 
 # Diese Einstellungen gelten für alle Arbeitsplätze (im gemeinsamen Ordner); Zugangsdaten bleiben pro PC.
 SHARED_SETTINGS = ("default_weight_kg", "shipping_option_de", "shipping_option_eu", "contract_id", "brand_id",
                    "sender_name", "sender_company", "sender_email", "sender_phone", "sender_street",
                    "sender_house_number", "sender_postal_code", "sender_city", "sender_country", "use_history",
-                   "s4t_host", "s4t_cert_sha256", "s4t_tag", "s4t_status_id", "s4t_mandator", "s4t_report")
+                   "s4t_host", "s4t_cert_sha256", "s4t_tag", "s4t_status_id", "s4t_mandator", "s4t_report",
+                   "carrier", "dhl_sandbox", "dhl_billing", "dhl_profile", "dhl_print_format")
 REQUIRED_SENDER = (("sender_company", "Absender Firma"), ("sender_street", "Absender Straße"),
                    ("sender_house_number", "Absender Hausnr."), ("sender_postal_code", "Absender PLZ"),
                    ("sender_city", "Absender Ort"), ("sender_country", "Absender Land"),
@@ -190,6 +198,35 @@ class Config:
     @s4t_password.setter
     def s4t_password(self, pw):
         self.cp["settings"]["s4t_password_enc"] = protect(pw)
+
+    @property
+    def dhl_password(self):
+        return unprotect(self.cp["settings"].get("dhl_password_enc", ""))
+
+    @property
+    def dhl_api_key(self):
+        return unprotect(self.cp["settings"].get("dhl_api_key_enc", ""))
+
+    @property
+    def dhl_api_secret(self):
+        return unprotect(self.cp["settings"].get("dhl_api_secret_enc", ""))
+
+    def set_dhl(self, api_key, api_secret, password):
+        self.cp["settings"]["dhl_api_key_enc"] = protect(api_key.strip())
+        self.cp["settings"]["dhl_api_secret_enc"] = protect(api_secret.strip())
+        self.cp["settings"]["dhl_password_enc"] = protect(password)
+
+    @property
+    def carrier_missing(self):
+        """Fehlende Zugangsdaten für den eingestellten Versandweg (leer = bereit)."""
+        if self["carrier"] != "dhl":
+            return [] if self.public_key and self.secret_key else ["Sendcloud-Zugangsdaten"]
+        miss = [n for v, n in ((self.dhl_api_key, "DHL API-Key"), (self.dhl_api_secret, "DHL API-Secret")) if not v]
+        if self["dhl_sandbox"] != "1":
+            miss += [n for v, n in ((self["dhl_user"].strip(), "DHL GKP-Benutzer"), (self.dhl_password, "DHL Passwort"),
+                                    (re.fullmatch(r"\w{10}\d{2}\w{2}", self["dhl_billing"].strip()),
+                                     "DHL Abrechnungsnummer (14-stellig)")) if not v]
+        return miss
 
     @property
     def s4t_ready(self):
@@ -652,6 +689,203 @@ class Sendcloud:
         """Mehrere Labels in einem PDF (bei A4 mehrere Labels pro Seite), max. 20 je Aufruf."""
         q = urllib.parse.urlencode([("parcels", int(p)) for p in parcel_ids] + [("paper_size", paper)])
         return self._call("GET", "/parcel-documents/label?" + q, raw=True, accept="application/pdf")
+
+
+# --------------------------------------------------------------------------- DHL direkt (Parcel DE Shipping API v2)
+
+DHL_API = {False: "https://api-eu.dhl.com", True: "https://api-sandbox.dhl.com"}
+DHL_SANDBOX_LOGIN = ("user-valid", "SandboxPasswort2023!", "33333333330102")  # öffentliche Testdaten von DHL
+DHL_PREFIX = "dhl:"  # parcel_id-Kennung für direkt bei DHL angelegte Sendungen (Sendcloud-IDs sind reine Zahlen)
+PACKSTATION_RX = re.compile(r"packstation\s*(\d{3})\b", re.I)
+FILIALE_RX = re.compile(r"(?:post)?filiale\s*(\d{3})\b", re.I)
+
+
+class DHLError(SendcloudError):
+    pass
+
+
+class DHL:
+    """Labels direkt bei DHL (Geschäftskundenvertrag), nur DHL Paket national (V01PAK).
+    Gleiche Schnittstelle wie Sendcloud: test, existing, announce, label_pdf."""
+    _tokens = {}  # (Umgebung, Benutzer) -> (Token, gültig bis); Token gilt 30 min
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.sandbox = cfg["dhl_sandbox"] == "1"
+        self.base = DHL_API[self.sandbox]
+        self.user, self.password, self.billing = DHL_SANDBOX_LOGIN if self.sandbox else \
+            (cfg["dhl_user"].strip(), cfg.dhl_password, cfg["dhl_billing"].strip())
+        self._pdfs = {}  # Labels aus der Anlage-Antwort, spart den zweiten Abruf
+
+    def _token(self):
+        key = (self.sandbox, self.user)
+        tok, until = DHL._tokens.get(key, ("", 0))
+        if tok and time.time() < until:
+            return tok
+        body = urllib.parse.urlencode({"grant_type": "password", "username": self.user, "password": self.password,
+                                       "client_id": self.cfg.dhl_api_key, "client_secret": self.cfg.dhl_api_secret})
+        req = urllib.request.Request(self.base + "/parcel/de/account/auth/ropc/v1/token", data=body.encode(),
+                                     method="POST", headers={"Content-Type": "application/x-www-form-urlencoded",
+                                                             "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                d = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            raise DHLError(f"DHL-Anmeldung abgelehnt (HTTP {e.code}) – API-Key/Secret und GKP-Benutzer/Passwort prüfen")
+        except urllib.error.URLError as e:
+            raise DHLError(f"Keine Verbindung zu DHL: {e.reason}")
+        tok = d["access_token"]
+        DHL._tokens[key] = (tok, time.time() + int(d.get("expires_in") or 1800) - 60)
+        return tok
+
+    def _call(self, method, path, body=None):
+        req = urllib.request.Request(self.base + "/parcel/de/shipping/v2" + path, method=method,
+                                     data=json.dumps(body).encode() if body is not None else None,
+                                     headers={"Authorization": "Bearer " + self._token(),
+                                              "dhl-api-key": self.cfg.dhl_api_key, "Accept": "application/json",
+                                              "Accept-Language": "de-DE", "Content-Type": "application/json"})
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=90) as r:
+                    return json.loads(r.read() or b"{}")
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and attempt < 2:
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                if e.code == 401:
+                    DHL._tokens.pop((self.sandbox, self.user), None)
+                    raise DHLError("DHL hat die Anmeldung abgelehnt (HTTP 401) – Zugangsdaten prüfen")
+                raw = e.read().decode(errors="replace")
+                try:
+                    msg = self._errors(json.loads(raw))
+                except Exception:
+                    msg = raw
+                raise DHLError(f"HTTP {e.code}: {msg[:500]}")
+            except urllib.error.URLError as e:
+                raise DHLError(f"Keine Verbindung zu DHL: {e.reason}")
+
+    @staticmethod
+    def _errors(d, states=("Error",)):
+        msgs = [f'{m.get("property", "")}: {m.get("validationMessage", "")}'.strip(": ")
+                for it in d.get("items") or [] for m in it.get("validationMessages") or []
+                if m.get("validationState") in states]
+        st = d.get("status") or {}
+        return "; ".join(msgs) or st.get("detail") or st.get("title") or json.dumps(d, ensure_ascii=False)
+
+    def _shipper(self):
+        c = self.cfg
+        s = {"name1": c["sender_company"][:50], "addressStreet": c["sender_street"][:50],
+             "addressHouse": c["sender_house_number"][:10], "postalCode": c["sender_postal_code"],
+             "city": c["sender_city"][:40], "country": "DEU"}
+        if c["sender_name"].strip():
+            s["contactName"] = c["sender_name"][:80]
+        if c["sender_email"].strip():
+            s["email"] = c["sender_email"][:80]
+        return s
+
+    @staticmethod
+    def consignee(o: Order):
+        """Hausadresse, Packstation oder Postfiliale. Die Postnummer steht je nach Kunde im Zusatz, Firmen- oder
+        Namensfeld."""
+        text = " ".join((o.street, o.house, o.addr2, o.company))
+        postnr = re.search(r"\b(\d{6,10})\b", " ".join((o.addr2, o.company, o.name, o.street, o.house)))
+        m = PACKSTATION_RX.search(text)
+        if m:
+            if not postnr:
+                raise DHLError("Packstation ohne Postnummer – bitte im Adresszusatz ergänzen")
+            return {"name": o.name[:50], "lockerID": int(m.group(1)), "postNumber": postnr.group(1),
+                    "postalCode": o.zip, "city": o.city[:40], "country": "DEU"}
+        m = FILIALE_RX.search(text)
+        if m and 401 <= int(m.group(1)) <= 999:
+            p = {"name": o.name[:50], "retailID": int(m.group(1)), "postalCode": o.zip, "city": o.city[:80],
+                 "country": "DEU"}
+            if postnr:
+                p["postNumber"] = postnr.group(1)
+            elif o.email:
+                p["email"] = o.email[:80]
+            else:
+                raise DHLError("Postfiliale ohne Postnummer oder E-Mail – bitte ergänzen")
+            return p
+        a = {"name1": (o.company or o.name)[:50], "addressStreet": o.street[:50], "postalCode": o.zip,
+             "city": o.city[:40], "country": "DEU"}
+        if o.company and o.name:
+            a["name2"] = o.name[:50]
+        if o.house:
+            a["addressHouse"] = o.house[:10]
+        if o.addr2:
+            a["additionalAddressInformation1"] = o.addr2[:60]
+        if o.email:
+            a["email"] = o.email[:80]
+        if o.phone:
+            a["phone"] = o.phone[:20]
+        return a
+
+    def _shipment(self, o: Order):
+        if o.country != "DE":
+            raise DHLError("Über DHL direkt ist nur Inlandsversand eingerichtet – bitte über Sendcloud senden")
+        if o.weight > 31.5:
+            raise DHLError(f"{o.weight:.2f} kg je Paket – DHL Paket erlaubt höchstens 31,5 kg")
+        return {"product": "V01PAK", "billingNumber": self.billing, "refNo": f"Auftrag {o.ref}"[:35],
+                "shipper": self._shipper(), "consignee": self.consignee(o),
+                "details": {"weight": {"uom": "kg", "value": round(max(o.weight, 0.01), 3)}}}
+
+    def _query(self, **extra):
+        q = {"printFormat": self.cfg["dhl_print_format"] or "910-300-300", "includeDocs": "include", **extra}
+        return "?" + urllib.parse.urlencode(q)
+
+    def test(self):
+        """Anmeldung und Abrechnungsnummer prüfen: Probe-Sendung an die eigene Adresse, nur validiert."""
+        me = Order("00000000")
+        c = self.cfg
+        me.name, me.street, me.house = c["sender_company"], c["sender_street"], c["sender_house_number"]
+        me.zip, me.city, me.country, me.weight = c["sender_postal_code"], c["sender_city"], "DE", 1.0
+        d = self._call("POST", "/orders" + self._query(validate="true"),
+                       {"profile": c["dhl_profile"] or "STANDARD_GRUPPENPROFIL", "shipments": [self._shipment(me)]})
+        if any((it.get("sstatus") or {}).get("status", 200) >= 400 for it in d.get("items") or []):
+            raise DHLError(self._errors(d))
+
+    def existing(self, o: Order):
+        """DHL kennt keine Suche nach Auftragsnummer – deshalb in Speed4Trade nachsehen, ob schon eine
+        Sendungsnummer am Auftrag steht (schützt vor doppelten Labels, auch von anderen Arbeitsplätzen)."""
+        if not (o.s4t_id and self.cfg.s4t_ready):
+            return []
+        x = S4T(self.cfg).order(o.s4t_id)
+        tracks = [(t.text or "").strip() for t in x.iter("tracking_number")] if x is not None else []
+        return [{"tracking_number": t, "id": DHL_PREFIX + t} for t in tracks if t]
+
+    def announce(self, o: Order):
+        d = self._call("POST", "/orders" + self._query(mustEncode="false"),
+                       {"profile": self.cfg["dhl_profile"] or "STANDARD_GRUPPENPROFIL", "shipments": [self._shipment(o)]})
+        it = (d.get("items") or [{}])[0]
+        if not it.get("shipmentNo"):
+            raise DHLError(f"Keine Sendungsnummer erhalten: {self._errors(d)}")
+        hints = self._errors({"items": [it]}, states=("Warning",)) if it.get("validationMessages") else ""
+        if hints and not hints.startswith("{"):
+            o.hints.append("DHL: " + hints)
+        if (it.get("label") or {}).get("b64"):
+            self._pdfs[it["shipmentNo"]] = base64.b64decode(it["label"]["b64"])
+        return {"tracking_number": it["shipmentNo"], "id": DHL_PREFIX + it["shipmentNo"]}
+
+    def label_pdf(self, parcel_id):
+        """Label erneut abrufen – bei DHL nur bis zum Tagesabschluss möglich."""
+        no = str(parcel_id).removeprefix(DHL_PREFIX)
+        if no in self._pdfs:
+            return self._pdfs[no]
+        d = self._call("GET", "/orders" + self._query() + "&" + urllib.parse.urlencode({"shipment": no}))
+        b64 = ((d.get("items") or [{}])[0].get("label") or {}).get("b64")
+        if not b64:
+            raise DHLError(f"Label nicht mehr abrufbar (nach dem Tagesabschluss): {self._errors(d)}")
+        return base64.b64decode(b64)
+
+
+def carrier(cfg: Config):
+    """Versandweg laut Einstellungen."""
+    return DHL(cfg) if cfg["carrier"] == "dhl" else Sendcloud(cfg)
+
+
+def label_client(cfg: Config, parcel_id):
+    """Zum Nachladen eines Labels: Herkunft steht an der ID, unabhängig vom eingestellten Versandweg."""
+    return DHL(cfg) if str(parcel_id).startswith(DHL_PREFIX) else Sendcloud(cfg)
 
 
 # --------------------------------------------------------------------------- Speed4Trade CONNECT
@@ -1517,8 +1751,8 @@ class App(tk.Tk):
         self.after(5000, self._update_tick)
         self._s4t_running = False
         self.after(3000, self._s4t_tick)
-        if not self.cfg.public_key:
-            self.after(300, lambda: (messagebox.showinfo(APP_NAME, "Bitte zuerst die Sendcloud-Zugangsdaten in den "
+        if self.cfg.carrier_missing:
+            self.after(300, lambda: (messagebox.showinfo(APP_NAME, "Bitte zuerst die Zugangsdaten für den Versand in den "
                                                                     "Einstellungen hinterlegen."), self.settings()))
 
     def _build(self):
@@ -2375,10 +2609,13 @@ class App(tk.Tk):
             sel = [o for o in sel if not o.validate()]
             if not sel:
                 return
-        if not self.cfg.public_key or not self.cfg.secret_key:
-            messagebox.showerror(APP_NAME, "Keine Sendcloud-Zugangsdaten hinterlegt.")
+        if self.cfg.carrier_missing:
+            messagebox.showerror(APP_NAME, "Zugangsdaten fehlen – bitte unter Einstellungen eintragen:\n\n• "
+                                 + "\n• ".join(self.cfg.carrier_missing))
             return
-        missing = [label for k, label in REQUIRED_SENDER if not self.cfg[k].strip()]
+        dhl = self.cfg["carrier"] == "dhl"
+        missing = [label for k, label in REQUIRED_SENDER
+                   if not self.cfg[k].strip() and not (dhl and k == "contract_id")]
         if missing:
             messagebox.showerror(APP_NAME, "Absenderdaten fehlen – bitte unter Einstellungen eintragen:\n\n• "
                                  + "\n• ".join(missing))
@@ -2386,7 +2623,8 @@ class App(tk.Tk):
             return
         high = [o for o in sel if o.value / o.parcels > 500]
         n_parcels = sum(o.parcels for o in sel)
-        msg = (f"{len(sel)} Auftrag/Aufträge mit insgesamt {n_parcels} Paket(en) bei Sendcloud anlegen und bei DHL "
+        via = ("direkt bei DHL" + (" (TESTUMGEBUNG)" if self.cfg["dhl_sandbox"] == "1" else "")) if dhl else             "bei Sendcloud"
+        msg = (f"{len(sel)} Auftrag/Aufträge mit insgesamt {n_parcels} Paket(en) {via} anlegen und bei DHL "
                f"anmelden?\n\nGesamtgewicht {sum(o.weight * o.parcels for o in sel):.2f} kg. "
                f"Die Labels sind kostenpflichtig.").replace(".", ",", 1)
         if high:
@@ -2404,7 +2642,7 @@ class App(tk.Tk):
         """Label-PDFs zu (tracking, parcel_id)-Paaren herunterladen und im Programm ablegen."""
         for tracking, pid in parcels:
             try:
-                store_label(o, tracking, sc.label_pdf(pid), self.cfg)
+                store_label(o, tracking, (sc or label_client(self.cfg, pid)).label_pdf(pid), self.cfg)
             except Exception as e:
                 o.hints.append(f"Label-PDF für {tracking} nicht geladen: {e}")
 
@@ -2444,7 +2682,8 @@ class App(tk.Tk):
             messagebox.showerror(APP_NAME, f"Meldung an Speed4Trade fehlgeschlagen:\n\n{o.s4t_error}")
 
     def _worker(self, sel):
-        sc = Sendcloud(self.cfg)
+        sc = carrier(self.cfg)
+        where = "bei DHL" if isinstance(sc, DHL) else "in Sendcloud"
         for n, o in enumerate(sel, 1):
             i = self.orders.index(o)
             if BACKEND is not None:  # erst im gemeinsamen Ordner reservieren – nur einer kann gewinnen
@@ -2470,15 +2709,15 @@ class App(tk.Tk):
             try:
                 o.status, o.error = "wird gesendet…", ""
                 self.q.put(("row", i))
-                ex = sc.existing(o.ref)
+                ex = sc.existing(o) if isinstance(sc, DHL) else sc.existing(o.ref)
                 if ex:
                     o.tracking = ", ".join(p["tracking_number"] for p in ex)
                     o.parcel_id = ", ".join(str(p["id"]) for p in ex)
                     o.status = "bereits vorhanden"
                     if len(ex) < o.parcels:
-                        o.hints.append(f"Achtung: in Sendcloud nur {len(ex)} von {o.parcels} Paketen vorhanden – "
+                        o.hints.append(f"Achtung: {where} nur {len(ex)} von {o.parcels} Paketen vorhanden – "
                                        "fehlende bitte manuell anlegen")
-                    append_log(o, "bereits in Sendcloud vorhanden, nicht neu angelegt")
+                    append_log(o, f"bereits {where} vorhanden, nicht neu angelegt")
                     self._fetch_labels(sc, o, [(p["tracking_number"], p["id"]) for p in ex])
                 else:
                     tracks, ids = [], []
@@ -3046,19 +3285,21 @@ class App(tk.Tk):
 
         def run():
             try:
-                sc = Sendcloud(self.cfg)
                 target = os.path.join(PRINT_DIR, f"sammeldruck_{dt.datetime.now():%Y%m%d_%H%M%S}.pdf")
                 if paper == "A6":
                     parts = []
                     for o in orders:  # fehlende Labels nachladen
                         if not o.label_paths and o.parcel_id:
-                            self._fetch_labels(sc, o, zip(o.tracking.split(", "), o.parcel_id.split(", ")))
+                            self._fetch_labels(None, o, zip(o.tracking.split(", "), o.parcel_id.split(", ")))
                         parts += o.label_paths
                     if not parts:
                         raise RuntimeError("Keine Label-PDFs gefunden.")
                     parts = [to_a6(open(p, "rb").read()) for p in parts]  # auch ältere, nicht umgerechnete Labels
                 else:
+                    if any(pid.startswith(DHL_PREFIX) for o in orders for pid in o.parcel_id.split(", ")):
+                        raise RuntimeError("Labels, die direkt bei DHL erstellt wurden, bitte im Format A6 drucken.")
                     ids = [pid for o in orders for pid in o.parcel_id.split(", ") if pid.strip().isdigit()]
+                    sc = Sendcloud(self.cfg)
                     if not ids:
                         raise RuntimeError("Für A4 werden Sendcloud-Paket-IDs benötigt (keine vorhanden).")
                     parts = [sc.labels_bulk(ids[k:k + 20], "A4") for k in range(0, len(ids), 20)]
@@ -3624,6 +3865,15 @@ class SettingsDialog(tk.Toplevel):
         ttk.Checkbutton(f, text="Ohne Druckdialog direkt auf den zuletzt gewählten Drucker drucken",
                         variable=self.print_direct).grid(row=r, column=0, columnspan=2, sticky="w", pady=(8, 0))
         r += 1
+        ttk.Label(f, text="Versandweg", font=F["section"]).grid(row=r, column=0, sticky="w", pady=(14, 0))
+        self.carrier = tk.StringVar(value=cfg["carrier"])
+        cf = ttk.Frame(f)
+        cf.grid(row=r + 1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Radiobutton(cf, text="Sendcloud", value="sendcloud", variable=self.carrier).pack(side="left")
+        ttk.Radiobutton(cf, text="DHL direkt (eigener Vertrag, nur Inland)", value="dhl",
+                        variable=self.carrier).pack(side="left", padx=(12, 12))
+        ttk.Button(cf, text="DHL-Zugang…", command=lambda: DHLDialog(self, self.cfg)).pack(side="left")
+        r += 2
         ttk.Label(f, text="Gemeinsamer Ordner", font=F["section"]).grid(row=r, column=0, sticky="w", pady=(14, 0))
         ttk.Label(f, text="Für mehrere Arbeitsplätze: Netzwerkordner, auf den alle schreiben dürfen "
                           "(z. B. \\\\server\\freigabe\\Versand). Leer = nur lokal.", foreground=C["muted"],
@@ -3671,6 +3921,7 @@ class SettingsDialog(tk.Toplevel):
         self.cfg["save_label_pdf"] = "1" if self.save_pdf.get() else "0"
         self.cfg["print_direct"] = "1" if self.print_direct.get() else "0"
         self.cfg["use_history"] = "1" if self.use_hist.get() else "0"
+        self.cfg["carrier"] = self.carrier.get()
         self.cfg["label_dir"] = self.label_dir.get().strip()
         new_shared = self.shared_dir.get().strip()
         if new_shared != self.cfg["shared_dir"].strip():
@@ -3852,6 +4103,96 @@ class S4TDialog(tk.Toplevel):
                 messagebox.showerror(APP_NAME, "Status-ID und Mandant müssen Zahlen sein.", parent=self)
                 return
         if self.vars["s4t_host"].get().strip() and not self.pin and not self._confirm_cert():
+            return
+        self._apply(self.cfg)
+        self.cfg.save()
+        if BACKEND is not None:
+            try:
+                BACKEND.put_settings({k: self.cfg[k] for k in SHARED_SETTINGS})
+            except OSError as e:
+                messagebox.showwarning(APP_NAME, f"Lokal gespeichert, aber nicht im gemeinsamen Ordner:\n{e}",
+                                       parent=self)
+        self.destroy()
+
+
+class DHLDialog(tk.Toplevel):
+    FIELDS = [("dhl_user", "GKP-Benutzer"), ("dhl_billing", "Abrechnungsnummer DHL Paket"),
+              ("dhl_profile", "Gruppenprofil")]
+    PRINT_FORMATS = ("910-300-300", "910-300-400", "910-300-600", "910-300-700", "A4")
+
+    def __init__(self, master, cfg: Config):
+        super().__init__(master)
+        self.cfg = cfg
+        self.title("DHL-Zugang (Geschäftskunden)")
+        self.resizable(False, False)
+        self.transient(master)
+        f = ttk.Frame(self, padding=14)
+        f.pack(fill="both")
+        ttk.Label(f, text="API-Key und Secret stammen aus der App im DHL Developer Portal (developer.dhl.com), "
+                          "Benutzer und Passwort aus dem DHL-Geschäftskundenportal (am besten ein Systembenutzer). "
+                          "Die Abrechnungsnummer ist 14-stellig: EKP + 01 (DHL Paket) + Teilnahme.",
+                  foreground=C["muted"], wraplength=470).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        self.key, self.secret, self.pw = (tk.StringVar(value=v) for v in
+                                          (cfg.dhl_api_key, cfg.dhl_api_secret, cfg.dhl_password))
+        rows = [("API-Key", self.key, ""), ("API-Secret", self.secret, "•")]
+        self.vars = {k: tk.StringVar(value=cfg[k]) for k, _ in self.FIELDS}
+        rows += [(self.FIELDS[0][1], self.vars["dhl_user"], ""), ("Passwort", self.pw, "•"),
+                 (self.FIELDS[1][1], self.vars["dhl_billing"], ""), (self.FIELDS[2][1], self.vars["dhl_profile"], "")]
+        for r, (label, var, show) in enumerate(rows, 1):
+            ttk.Label(f, text=label).grid(row=r, column=0, sticky="w", pady=2)
+            ttk.Entry(f, textvariable=var, width=40, show=show).grid(row=r, column=1, sticky="w", padx=(8, 0))
+        r = len(rows) + 1
+        ttk.Label(f, text="Labelformat").grid(row=r, column=0, sticky="w", pady=2)
+        self.fmt = tk.StringVar(value=cfg["dhl_print_format"] or "910-300-300")
+        ttk.Combobox(f, textvariable=self.fmt, values=self.PRINT_FORMATS, width=14, state="readonly").grid(
+            row=r, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(f, text="910-300-300 = 105 × 148 mm (A6)", foreground=C["muted"]).grid(
+            row=r + 1, column=1, sticky="w", padx=(8, 0))
+        self.sandbox = tk.BooleanVar(value=cfg["dhl_sandbox"] == "1")
+        ttk.Checkbutton(f, text="Testumgebung (Sandbox) – keine echten Labels, nur API-Key/Secret nötig",
+                        variable=self.sandbox).grid(row=r + 2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        b = ttk.Frame(f)
+        b.grid(row=r + 3, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        ttk.Button(b, text="Verbindung testen", command=self.test).pack(side="left", padx=(0, 16))
+        ttk.Button(b, text="Speichern", command=self.ok).pack(side="left")
+        ttk.Button(b, text="Abbrechen", command=self.destroy).pack(side="left", padx=(6, 0))
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.grab_set()
+        self.wait_window()
+
+    def _apply(self, cfg):
+        for k, v in self.vars.items():
+            cfg[k] = v.get().strip().replace(" ", "") if k == "dhl_billing" else v.get().strip()
+        cfg.set_dhl(self.key.get(), self.secret.get(), self.pw.get())
+        cfg["dhl_print_format"] = self.fmt.get()
+        cfg["dhl_sandbox"] = "1" if self.sandbox.get() else "0"
+
+    def test(self):
+        tmp = Config.__new__(Config)  # Kopie: Test ohne die gespeicherten Einstellungen zu ändern
+        tmp.cp = configparser.ConfigParser()
+        tmp.cp.read_dict(self.cfg.cp)
+        self._apply(tmp)
+        tmp["carrier"] = "dhl"
+        if tmp.carrier_missing:
+            messagebox.showerror(APP_NAME, "Es fehlt:\n\n• " + "\n• ".join(tmp.carrier_missing), parent=self)
+            return
+        self.configure(cursor="watch")
+        self.update()
+        try:
+            DHL(tmp).test()
+            messagebox.showinfo(APP_NAME, "Verbindung zu DHL erfolgreich – Probe-Sendung an die eigene Adresse wurde "
+                                          "geprüft (nicht angelegt)."
+                                + ("\n\nAchtung: Testumgebung aktiv." if tmp["dhl_sandbox"] == "1" else ""), parent=self)
+        except Exception as e:
+            messagebox.showerror(APP_NAME, str(e), parent=self)
+        finally:
+            self.configure(cursor="")
+
+    def ok(self):
+        billing = self.vars["dhl_billing"].get().strip().replace(" ", "")
+        if billing and not re.fullmatch(r"\w{10}\d{2}\w{2}", billing):
+            messagebox.showerror(APP_NAME, "Die Abrechnungsnummer muss 14 Stellen haben (EKP + 01 + Teilnahme).",
+                                 parent=self)
             return
         self._apply(self.cfg)
         self.cfg.save()
