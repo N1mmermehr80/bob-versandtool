@@ -4333,13 +4333,14 @@ class EditDialog(tk.Toplevel):
         self.destroy()
 
 
-SETTINGS_PAGES = ["Allgemein", "Absender", "Versand", "DHL", "Speed4Trade", "Arbeitsplätze", "Darstellung"]
+SETTINGS_PAGES = ["Allgemein", "Absender", "Versand", "Sendcloud", "DHL", "Speed4Trade", "Arbeitsplätze",
+                  "Darstellung"]
 
 
 class SettingsDialog(tk.Toplevel):
     """Alle Einstellungen in einem Fenster mit Reitern, gespeichert wird gemeinsam."""
     PRINT_FORMATS = ("910-300-400", "910-300-300-oz", "910-300-300", "910-300-600", "910-300-700-oz", "910-300-700", "A4")
-    SIZE = (840, 660)
+    SIZE = (920, 660)
 
     def __init__(self, master, cfg: Config, page="Allgemein"):
         super().__init__(master)
@@ -4366,8 +4367,8 @@ class SettingsDialog(tk.Toplevel):
         body = tk.Frame(self, bg=C["paper"])
         body.pack(fill="both", expand=True)
         self.pages = {}
-        for name, build in zip(SETTINGS_PAGES, (self._p_general, self._p_sender, self._p_shipping, self._p_dhl,
-                                                self._p_s4t, self._p_network, self._p_colors)):
+        for name, build in zip(SETTINGS_PAGES, (self._p_general, self._p_sender, self._p_shipping, self._p_sendcloud,
+                                                self._p_dhl, self._p_s4t, self._p_network, self._p_colors)):
             pg = ttk.Frame(body, style="Card.TFrame", padding=(28, 18, 28, 12))
             pg.place(x=0, y=0, relwidth=1, relheight=1)
             build(pg)
@@ -4394,7 +4395,7 @@ class SettingsDialog(tk.Toplevel):
         if action:
             ttk.Button(h, text=action[0], command=action[1]).pack(side="right")
         if hint:
-            ttk.Label(parent, text=hint, style="CardMuted.TLabel", wraplength=760,
+            ttk.Label(parent, text=hint, style="CardMuted.TLabel", wraplength=840,
                       justify="left").pack(anchor="w", pady=(2, 0), fill="x")
         g = ttk.Frame(parent, style="Card.TFrame")
         g.pack(fill="x", pady=(6, 0))
@@ -4480,12 +4481,7 @@ class SettingsDialog(tk.Toplevel):
 
     # ----- Reiter
     def _p_general(self, pg):
-        g = self._head(pg, "Gewicht", "Gilt, wenn ein Auftrag kein Gewicht mitbringt.", top=0)
-        self._row(g, "Standardgewicht", self._var("default_weight_kg"), width=8, note="kg")
-        self._check(g, "use_history", "Fehlende Gewichte und Paketanzahl aus früheren Sendungen übernehmen")
-        ttk.Button(g, text="Erfahrungswerte jetzt neu laden", command=self.reload_hist).grid(
-            row=g.grid_size()[1], column=0, columnspan=3, sticky="w", pady=(2, 0), padx=(24, 0))
-        g = self._head(pg, "Drucken", top=18)
+        g = self._head(pg, "Drucken", top=0)
         self._check(g, "print_direct", "Ohne Druckdialog direkt auf den zuletzt gewählten Drucker drucken")
         self._check(g, "save_label_pdf", "Label-PDFs zusätzlich in diesen Ordner kopieren:")
         self._folder(g, self._var("label_dir"))
@@ -4515,15 +4511,24 @@ class SettingsDialog(tk.Toplevel):
                    top=0).destroy()
         self.carrier = tk.StringVar(value=self.cfg["carrier"])
         self._cards(pg, self.carrier, [
-            ("sendcloud", "Sendcloud", "Labels über das Sendcloud-Konto, Inland und EU-Ausland."),
+            ("sendcloud", "Sendcloud", "Labels über das Sendcloud-Konto, Inland und EU-Ausland. "
+                                       "Zugang im Reiter „Sendcloud“."),
             ("dhl", "DHL direkt", "Über den eigenen DHL-Geschäftskundenvertrag, nur Inland. Zugang im Reiter „DHL“.")])
-        g = self._head(pg, "Sendcloud", "Public und Secret Key aus dem Sendcloud-Konto. Die Schlüssel bleiben "
-                                        "verschlüsselt auf diesem PC.", action=("Verbindung testen", self.test_sendcloud),
-                       top=20)
+        g = self._head(pg, "Gewicht", "Gilt, wenn ein Auftrag kein Gewicht mitbringt.", top=20)
+        self._row(g, "Standardgewicht", self._var("default_weight_kg"), width=8, note="kg")
+        self._check(g, "use_history", "Fehlende Gewichte und Paketanzahl aus früheren Sendungen übernehmen")
+        ttk.Button(g, text="Erfahrungswerte jetzt neu laden", command=self.reload_hist).grid(
+            row=g.grid_size()[1], column=0, columnspan=3, sticky="w", pady=(2, 0), padx=(24, 0))
+
+    def _p_sendcloud(self, pg):
+        g = self._head(pg, "Zugang", "Public und Secret Key aus dem Sendcloud-Konto. Die Schlüssel bleiben "
+                                     "verschlüsselt auf diesem PC.", action=("Verbindung testen", self.test_sendcloud),
+                       top=0)
         self.pub = tk.StringVar(value=self.cfg.public_key)
         self.sec = tk.StringVar(value=self.cfg.secret_key)
         self._row(g, "Public Key", self.pub, width=52)
         self._row(g, "Secret Key", self.sec, show="•", width=52)
+        g = self._head(pg, "Versandarten & Vertrag", "Gelten für alle Arbeitsplätze.", top=18)
         self._row(g, "Versandart Inland", self._var("shipping_option_de"), width=52)
         self._row(g, "Versandart EU-Ausland", self._var("shipping_option_eu"), width=52)
         self._row(g, "DHL-Vertrags-ID", self._var("contract_id"), width=14)
@@ -4778,10 +4783,10 @@ class SettingsDialog(tk.Toplevel):
         """Erste ungültige Eingabe als (Reiter, Meldung), sonst None."""
         v = lambda k: self.vars[k].get().strip()
         if _num(v("default_weight_kg")) is None:
-            return "Allgemein", "Standardgewicht ist keine Zahl."
+            return "Versand", "Standardgewicht ist keine Zahl."
         for k, name in (("contract_id", "DHL-Vertrags-ID"), ("brand_id", "Brand-ID")):
             if v(k) and not v(k).isdigit():
-                return "Versand", f"{name} muss eine Zahl sein."
+                return "Sendcloud", f"{name} muss eine Zahl sein."
         billing = v("dhl_billing").replace(" ", "")
         if billing and not re.fullmatch(r"\w{10}\d{2}\w{2}", billing):
             return "DHL", "Die Abrechnungsnummer muss 14 Stellen haben (EKP + 01 + Teilnahme)."
