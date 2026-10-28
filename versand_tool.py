@@ -2656,7 +2656,7 @@ class App(tk.Tk):
             return
         if not self.cfg.s4t_ready:
             messagebox.showinfo(APP_NAME, "Die Speed4Trade-Anbindung ist noch nicht eingerichtet.")
-            S4TDialog(self, self.cfg)
+            self.settings("Speed4Trade")
             if not self.cfg.s4t_ready:
                 return
         self.busy = True
@@ -2939,17 +2939,17 @@ class App(tk.Tk):
         EditDialog(self, o)
         self._after_change(iid)
 
-    def settings(self):
-        SettingsDialog(self, self.cfg)
-        if getattr(self, "restart_pending", False):  # neue Farben gewählt, erst nach dem Einstellungsfenster
+    def settings(self, page="Allgemein"):
+        SettingsDialog(self, self.cfg, page)
+        if getattr(self, "restart_pending", False):  # neue Farben/gemeinsamer Ordner, erst nach dem Fenster
             self.restart_pending = False
             self.restart()
 
     def restart(self):
         """Tool beenden und neu starten (z. B. für ein anderes Farbschema)."""
         if self.busy:
-            messagebox.showinfo(APP_NAME, "Es läuft gerade ein Vorgang. Die neuen Farben erscheinen nach dem "
-                                          "nächsten Start.")
+            messagebox.showinfo(APP_NAME, "Es läuft gerade ein Vorgang. Die Änderungen werden nach dem nächsten "
+                                          "Start wirksam.")
             return
         import subprocess
         self.save_session()
@@ -3881,10 +3881,21 @@ def apply_theme(root):
     s.configure("TFrame", background=C["hall"])
     s.configure("TLabel", background=C["hall"], foreground=C["ink"])
     s.configure("TLabelframe", background=C["hall"])
-    s.configure("TCheckbutton", background=C["hall"], foreground=C["ink"], indicatorbackground=C["paper"])
-    s.configure("TRadiobutton", background=C["hall"], foreground=C["ink"], indicatorbackground=C["paper"])
+    s.configure("TCheckbutton", background=C["hall"], foreground=C["ink"], indicatorbackground=C["paper"],
+                indicatorforeground=C["ink"])
+    s.configure("TRadiobutton", background=C["hall"], foreground=C["ink"], indicatorbackground=C["paper"],
+                indicatorforeground=C["ink"])
     s.map("TCheckbutton", background=[("active", C["hall"])])
     s.map("TRadiobutton", background=[("active", C["hall"])])
+    # Inhaltsflächen auf Papierweiß (Einstellungen)
+    s.configure("Card.TFrame", background=C["paper"])
+    s.configure("Card.TLabel", background=C["paper"], foreground=C["ink"])
+    s.configure("CardMuted.TLabel", background=C["paper"], foreground=C["muted"], font=F["small"])
+    s.configure("CardHead.TLabel", background=C["paper"], foreground=C["ink"], font=F["section"])
+    for w in ("TCheckbutton", "TRadiobutton"):
+        s.configure(f"Card.{w}", background=C["paper"], foreground=C["ink"], indicatorbackground=C["paper"],
+                    indicatorforeground=C["ink"])
+        s.map(f"Card.{w}", background=[("active", C["paper"])])
     s.configure("TCombobox", fieldbackground=C["paper"], foreground=C["ink"], background=C["paper"],
                 arrowcolor=C["muted"], bordercolor=C["line_strong"], lightcolor=C["paper"], darkcolor=C["paper"])
     s.map("TCombobox", fieldbackground=[("readonly", C["paper"])], foreground=[("readonly", C["ink"])])
@@ -4322,242 +4333,373 @@ class EditDialog(tk.Toplevel):
         self.destroy()
 
 
-class SettingsDialog(tk.Toplevel):
-    FIELDS = [("default_weight_kg", "Standardgewicht (kg)"), ("shipping_option_de", "Versandart Inland"),
-              ("shipping_option_eu", "Versandart EU-Ausland"), ("contract_id", "DHL-Vertrags-ID (Sendcloud)"),
-              ("brand_id", "Brand-ID (Sendcloud)"), ("sender_name", "Absender Name"),
-              ("sender_company", "Absender Firma"), ("sender_street", "Absender Straße"),
-              ("sender_house_number", "Absender Hausnr."), ("sender_postal_code", "Absender PLZ"),
-              ("sender_city", "Absender Ort"), ("sender_country", "Absender Land"),
-              ("sender_email", "Absender E-Mail"), ("sender_phone", "Absender Telefon")]
+SETTINGS_PAGES = ["Allgemein", "Absender", "Versand", "DHL", "Speed4Trade", "Arbeitsplätze", "Darstellung"]
 
-    def __init__(self, master, cfg: Config):
+
+class SettingsDialog(tk.Toplevel):
+    """Alle Einstellungen in einem Fenster mit Reitern, gespeichert wird gemeinsam."""
+    PRINT_FORMATS = ("910-300-400", "910-300-300-oz", "910-300-300", "910-300-600", "910-300-700-oz", "910-300-700", "A4")
+    SIZE = (840, 660)
+
+    def __init__(self, master, cfg: Config, page="Allgemein"):
         super().__init__(master)
         self.cfg = cfg
-        self.shared_changed = False
         self.title("Einstellungen")
         self.resizable(False, False)
         self.transient(master)
-        f = ttk.Frame(self, padding=12)
-        f.pack(fill="both")
-        ttk.Label(f, text="Sendcloud API", font=F["section"]).grid(row=0, column=0, sticky="w")
-        self.pub = tk.StringVar(value=cfg.public_key)
-        self.sec = tk.StringVar(value=cfg.secret_key)
-        ttk.Label(f, text="Public Key").grid(row=1, column=0, sticky="w", pady=2)
-        ttk.Entry(f, textvariable=self.pub, width=50).grid(row=1, column=1, sticky="w", padx=(8, 0))
-        ttk.Label(f, text="Secret Key").grid(row=2, column=0, sticky="w", pady=2)
-        ttk.Entry(f, textvariable=self.sec, width=50, show="•").grid(row=2, column=1, sticky="w", padx=(8, 0))
-        ttk.Button(f, text="Verbindung testen", command=self.test).grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(2, 8))
-        self.vars = {}
-        for r, (k, label) in enumerate(self.FIELDS, 4):
-            ttk.Label(f, text=label).grid(row=r, column=0, sticky="w", pady=2)
-            self.vars[k] = tk.StringVar(value=cfg[k])
-            ttk.Entry(f, textvariable=self.vars[k], width=50).grid(row=r, column=1, sticky="w", padx=(8, 0))
-        r = len(self.FIELDS) + 4
-        self.use_hist = tk.BooleanVar(value=cfg["use_history"] == "1")
-        ttk.Checkbutton(f, text="Fehlende Gewichte/Paketanzahl aus früheren Sendungen übernehmen",
-                        variable=self.use_hist).grid(row=r, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Button(f, text="Erfahrungswerte jetzt neu laden", command=self.reload_hist).grid(
-            row=r + 1, column=1, sticky="w", padx=(8, 0), pady=(2, 0))
-        r += 2
-        self.print_direct = tk.BooleanVar(value=cfg["print_direct"] == "1")
-        ttk.Checkbutton(f, text="Ohne Druckdialog direkt auf den zuletzt gewählten Drucker drucken",
-                        variable=self.print_direct).grid(row=r, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        r += 1
-        ttk.Label(f, text="Versandweg", font=F["section"]).grid(row=r, column=0, sticky="w", pady=(14, 0))
-        self.carrier = tk.StringVar(value=cfg["carrier"])
-        cf = ttk.Frame(f)
-        cf.grid(row=r + 1, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        ttk.Radiobutton(cf, text="Sendcloud", value="sendcloud", variable=self.carrier).pack(side="left")
-        ttk.Radiobutton(cf, text="DHL direkt (eigener Vertrag, nur Inland)", value="dhl",
-                        variable=self.carrier).pack(side="left", padx=(12, 12))
-        ttk.Button(cf, text="DHL-Zugang…", command=lambda: DHLDialog(self, self.cfg)).pack(side="left")
-        r += 2
-        ttk.Label(f, text="Gemeinsamer Ordner", font=F["section"]).grid(row=r, column=0, sticky="w", pady=(14, 0))
-        ttk.Label(f, text="Für mehrere Arbeitsplätze: Netzwerkordner, auf den alle schreiben dürfen "
-                          "(z. B. \\\\server\\freigabe\\Versand). Leer = nur lokal.", foreground=C["muted"],
-                  wraplength=520).grid(row=r + 1, column=0, columnspan=2, sticky="w")
-        self.shared_dir = tk.StringVar(value=cfg["shared_dir"])
-        sf = ttk.Frame(f)
-        sf.grid(row=r + 2, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        ttk.Entry(sf, textvariable=self.shared_dir, width=62).pack(side="left")
-        ttk.Button(sf, text="…", width=3, command=self._pick_shared).pack(side="left", padx=(4, 0))
-        r += 3
-        ttk.Label(f, text=f"Updates (installiert: Version {APP_VERSION})", font=F["section"]).grid(
-            row=r, column=0, columnspan=2, sticky="w", pady=(14, 0))
-        self.update_repo = tk.StringVar(value=cfg["update_repo"] or UPDATE_REPO)
-        uf = ttk.Frame(f)
-        uf.grid(row=r + 1, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        ttk.Label(uf, text="GitHub-Repository (besitzer/repo):").pack(side="left")
-        ttk.Entry(uf, textvariable=self.update_repo, width=30).pack(side="left", padx=(6, 6))
-        ttk.Button(uf, text="Jetzt nach Updates suchen", command=self._check_now).pack(side="left")
-        r += 2
-        self.save_pdf = tk.BooleanVar(value=cfg["save_label_pdf"] == "1")
-        ttk.Checkbutton(f, text="Label-PDFs zusätzlich kopieren in:", variable=self.save_pdf).grid(
-            row=r, column=0, sticky="w", pady=(8, 2))
-        self.label_dir = tk.StringVar(value=cfg["label_dir"])
-        lf = ttk.Frame(f)
-        lf.grid(row=r, column=1, sticky="w", padx=(8, 0), pady=(8, 2))
-        ttk.Entry(lf, textvariable=self.label_dir, width=41).pack(side="left")
-        ttk.Button(lf, text="…", width=3, command=lambda: self.label_dir.set(
-            filedialog.askdirectory(parent=self) or self.label_dir.get())).pack(side="left", padx=(4, 0))
-        ttk.Label(f, text=f"Einstellungen & Protokoll: {APP_DIR}", foreground=C["muted"]).grid(
-            row=r + 1, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        b = ttk.Frame(f)
-        b.grid(row=r + 2, column=0, columnspan=2, sticky="e", pady=(10, 0))
-        ttk.Button(b, text="Farben…", command=lambda: ColorDialog(self, self.cfg)).pack(side="left", padx=(0, 6))
-        ttk.Button(b, text="Protokoll öffnen", command=self.open_log).pack(side="left", padx=(0, 6))
-        ttk.Button(b, text="Speed4Trade-Anbindung…", command=lambda: S4TDialog(self, self.cfg)).pack(
-            side="left", padx=(0, 16))
-        ttk.Button(b, text="Speichern", command=self.ok).pack(side="left")
-        ttk.Button(b, text="Abbrechen", command=self.destroy).pack(side="left", padx=(6, 0))
-        center_over(self, master)
+        self.configure(bg=C["hall"])
+        self.vars, self.flags = {}, {}
+        head = tk.Frame(self, bg=C["hall"])
+        head.pack(fill="x", padx=24, pady=(18, 0))
+        tk.Label(head, text="Einstellungen", bg=C["hall"], fg=C["ink"], font=F["title"]).pack(side="left")
+        tk.Label(head, text=f"{APP_NAME} · Version {APP_VERSION}", bg=C["hall"], fg=C["muted"],
+                 font=F["small"]).pack(side="right")
+        self.page = tk.StringVar(value=page if page in SETTINGS_PAGES else SETTINGS_PAGES[0])
+        self.tabs = FilterTabs(self, self.page, self._show, SETTINGS_PAGES, {p: p for p in SETTINGS_PAGES})
+        self.tabs.pack(fill="x", padx=16, pady=(12, 0))
+        foot = tk.Frame(self, bg=C["hall"])
+        foot.pack(side="bottom", fill="x", padx=24, pady=12)
+        FlatButton(foot, "Speichern", self.ok, "primary").pack(side="right")
+        FlatButton(foot, "Abbrechen", self.destroy).pack(side="right", padx=(0, 8))
+        tk.Frame(self, height=1, bg=C["line"]).pack(side="bottom", fill="x")
+        tk.Frame(self, height=1, bg=C["line"]).pack(fill="x")
+        body = tk.Frame(self, bg=C["paper"])
+        body.pack(fill="both", expand=True)
+        self.pages = {}
+        for name, build in zip(SETTINGS_PAGES, (self._p_general, self._p_sender, self._p_shipping, self._p_dhl,
+                                                self._p_s4t, self._p_network, self._p_colors)):
+            pg = ttk.Frame(body, style="Card.TFrame", padding=(28, 18, 28, 12))
+            pg.place(x=0, y=0, relwidth=1, relheight=1)
+            build(pg)
+            self.pages[name] = pg
+        self._show()
+        self.bind("<Escape>", lambda e: self.destroy())
+        center_over(self, master, self.SIZE)
         self.grab_set()
         self.wait_window()
 
-    def _apply(self):
-        self.cfg.set_keys(self.pub.get(), self.sec.get())
-        for k, v in self.vars.items():
-            self.cfg[k] = v.get().strip()
-        self.cfg["save_label_pdf"] = "1" if self.save_pdf.get() else "0"
-        self.cfg["print_direct"] = "1" if self.print_direct.get() else "0"
-        self.cfg["use_history"] = "1" if self.use_hist.get() else "0"
-        self.cfg["carrier"] = self.carrier.get()
-        self.cfg["label_dir"] = self.label_dir.get().strip()
-        new_shared = self.shared_dir.get().strip()
-        if new_shared != self.cfg["shared_dir"].strip():
-            self.cfg["shared_dir"] = new_shared
-            self.shared_changed = True
-        repo = self.update_repo.get().strip().strip("/")
-        repo = re.sub(r"^https?://github\.com/", "", repo)  # auch komplette GitHub-Adresse akzeptieren
-        self.cfg["update_repo"] = "" if repo == UPDATE_REPO else repo
+    # ----- Bausteine
+    def _show(self):
+        self.pages[self.page.get()].tkraise()
 
-    def _check_now(self):
-        self._apply()
-        self.cfg.save()
-        self.master.check_updates(manual=True)
+    def _var(self, key, default=None):
+        self.vars[key] = tk.StringVar(value=self.cfg[key] or (default or ""))
+        return self.vars[key]
 
-    def reload_hist(self):
-        self._apply()
-        self.cfg.save()
-        self.destroy()
-        self.master.reload_history(notify=True)
+    def _head(self, parent, text, hint=None, action=None, top=14):
+        """Abschnitt mit Überschrift, optional Erklärung und Knopf rechts; liefert das Raster für die Felder."""
+        h = ttk.Frame(parent, style="Card.TFrame")
+        h.pack(fill="x", pady=(top, 0))
+        ttk.Label(h, text=text, style="CardHead.TLabel").pack(side="left", anchor="s")
+        if action:
+            ttk.Button(h, text=action[0], command=action[1]).pack(side="right")
+        if hint:
+            ttk.Label(parent, text=hint, style="CardMuted.TLabel", wraplength=760,
+                      justify="left").pack(anchor="w", pady=(2, 0), fill="x")
+        g = ttk.Frame(parent, style="Card.TFrame")
+        g.pack(fill="x", pady=(6, 0))
+        return g
 
-    def test(self):
-        self._apply()
+    def _row(self, g, label, var, show="", width=40, note=None, lw=24):
+        r = g.grid_size()[1]
+        ttk.Label(g, text=label, style="Card.TLabel", width=lw).grid(row=r, column=0, sticky="w", pady=3)
+        cell = ttk.Frame(g, style="Card.TFrame")
+        cell.grid(row=r, column=1, sticky="w")
+        e = ttk.Entry(cell, textvariable=var, width=width, show=show)
+        e.pack(side="left")
+        if note:
+            ttk.Label(cell, text=note, style="CardMuted.TLabel").pack(side="left", padx=(10, 0))
+        return e
+
+    def _check(self, parent, key, text, **grid):
+        self.flags[key] = tk.BooleanVar(value=self.cfg[key] == "1")
+        cb = ttk.Checkbutton(parent, text=text, variable=self.flags[key], style="Card.TCheckbutton")
+        cb.grid(row=parent.grid_size()[1], column=0, columnspan=3, sticky="w", pady=3, **grid)
+        return cb
+
+    def _folder(self, g, var, width=60):
+        r = g.grid_size()[1]
+        f = ttk.Frame(g, style="Card.TFrame")
+        f.grid(row=r, column=0, columnspan=3, sticky="w", pady=3)
+        ttk.Entry(f, textvariable=var, width=width).pack(side="left")
+        def pick():
+            d = filedialog.askdirectory(parent=self)
+            if d:
+                var.set(os.path.normpath(d))
+        ttk.Button(f, text="Durchsuchen…", command=pick).pack(side="left", padx=(6, 0))
+
+    def _cards(self, parent, var, options, on_pick=None):
+        """Auswahl als Kacheln: options = [(Wert, Titel, Beschreibung)]."""
+        row = ttk.Frame(parent, style="Card.TFrame")
+        row.pack(fill="x", pady=(6, 0))
+        tiles = {}
+
+        def paint():
+            for v, (tile, ws) in tiles.items():
+                on = v == var.get()
+                tile.configure(highlightbackground=C["signal"] if on else C["line"],
+                               highlightcolor=C["signal"] if on else C["line"])
+
+        def pick(v):
+            var.set(v)
+            paint()
+            on_pick and on_pick()
+        for i, (value, title, desc) in enumerate(options):
+            tile = tk.Frame(row, bg=C["paper"], highlightthickness=2, cursor="hand2", padx=14, pady=10)
+            tile.grid(row=0, column=i, sticky="nsew", padx=(0, 12))
+            row.columnconfigure(i, weight=1, uniform="cards")
+            t = tk.Label(tile, text=title, bg=C["paper"], fg=C["ink"], font=F["body_b"], anchor="w")
+            t.pack(fill="x")
+            d = tk.Label(tile, text=desc, bg=C["paper"], fg=C["muted"], font=F["small"], anchor="w", justify="left",
+                         wraplength=320)
+            d.pack(fill="x", pady=(2, 0))
+            for w in (tile, t, d):
+                w.bind("<Button-1>", lambda e, v=value: pick(v))
+            tiles[value] = (tile, (t, d))
+        paint()
+        return row
+
+    def _scratch(self):
+        """Kopie der Einstellungen mit den Eingaben, zum Testen ohne zu speichern."""
+        tmp = Config.__new__(Config)
+        tmp.cp = configparser.ConfigParser()
+        tmp.cp.read_dict(self.cfg.cp)
+        self._apply(tmp)
+        return tmp
+
+    def _busy_test(self, fn, ok_text):
+        self.configure(cursor="watch")
+        self.update()
         try:
-            Sendcloud(self.cfg).test()
-            messagebox.showinfo(APP_NAME, "Verbindung zu Sendcloud erfolgreich.", parent=self)
+            extra = fn()
+            messagebox.showinfo(APP_NAME, ok_text + (extra or ""), parent=self)
         except Exception as e:
             messagebox.showerror(APP_NAME, str(e), parent=self)
+        finally:
+            self.configure(cursor="")
 
-    def open_log(self):
-        if BACKEND is not None:
-            os.startfile(BACKEND.dirs["protokoll"])
-        elif os.path.exists(LOG_PATH):
-            os.startfile(LOG_PATH)
-        else:
-            messagebox.showinfo(APP_NAME, "Noch kein Protokoll vorhanden.", parent=self)
+    # ----- Reiter
+    def _p_general(self, pg):
+        g = self._head(pg, "Gewicht", "Gilt, wenn ein Auftrag kein Gewicht mitbringt.", top=0)
+        self._row(g, "Standardgewicht", self._var("default_weight_kg"), width=8, note="kg")
+        self._check(g, "use_history", "Fehlende Gewichte und Paketanzahl aus früheren Sendungen übernehmen")
+        ttk.Button(g, text="Erfahrungswerte jetzt neu laden", command=self.reload_hist).grid(
+            row=g.grid_size()[1], column=0, columnspan=3, sticky="w", pady=(2, 0), padx=(24, 0))
+        g = self._head(pg, "Drucken", top=18)
+        self._check(g, "print_direct", "Ohne Druckdialog direkt auf den zuletzt gewählten Drucker drucken")
+        self._check(g, "save_label_pdf", "Label-PDFs zusätzlich in diesen Ordner kopieren:")
+        self._folder(g, self._var("label_dir"))
+        g = self._head(pg, "Protokoll", f"Einstellungen und Protokoll dieses Arbeitsplatzes liegen in {APP_DIR}",
+                       top=18)
+        ttk.Button(g, text="Protokoll öffnen", command=self.open_log).grid(row=0, column=0, sticky="w")
 
-    def ok(self):
-        if _num(self.vars["default_weight_kg"].get()) is None:
-            messagebox.showerror(APP_NAME, "Standardgewicht ist keine Zahl.", parent=self)
-            return
-        for k in ("contract_id", "brand_id"):
-            if self.vars[k].get().strip() and not self.vars[k].get().strip().isdigit():
-                messagebox.showerror(APP_NAME, f"{k} muss eine Zahl sein.", parent=self)
-                return
-        new_shared = self.shared_dir.get().strip()
-        if new_shared and new_shared != self.cfg["shared_dir"].strip():
-            try:  # Schreibrecht prüfen, bevor der Ordner übernommen wird
-                os.makedirs(new_shared, exist_ok=True)
-                probe = os.path.join(new_shared, f".schreibtest_{USER}.tmp")
-                with open(probe, "w") as fh:
-                    fh.write("ok")
-                os.remove(probe)
-            except OSError as e:
-                messagebox.showerror(APP_NAME, f"In diesen Ordner kann nicht geschrieben werden:\n{new_shared}\n\n{e}",
-                                     parent=self)
-                return
-        self._apply()
-        self.cfg.save()
-        if BACKEND is not None and not self.shared_changed:
-            try:
-                BACKEND.put_settings({k: self.cfg[k] for k in SHARED_SETTINGS})
-            except OSError as e:
-                messagebox.showwarning(APP_NAME, f"Einstellungen lokal gespeichert, aber nicht im gemeinsamen "
-                                                 f"Ordner:\n{e}", parent=self)
-        self.destroy()
-        if self.shared_changed:
-            messagebox.showinfo(APP_NAME, "Der gemeinsame Ordner wurde geändert.\n\nBitte das Tool jetzt schließen "
-                                          "und neu starten, damit die gemeinsame Liste geladen wird.")
+    def _p_sender(self, pg):
+        g = self._head(pg, "Absender", "Steht als Absender auf jedem Label. Gilt für alle Arbeitsplätze.", top=0)
+        layout = [(("sender_company", "Firma", 36), ("sender_name", "Name / Ansprechpartner", 36)),
+                  (("sender_street", "Straße", 36), ("sender_house_number", "Hausnr.", 10)),
+                  (("sender_postal_code", "PLZ", 10), ("sender_city", "Ort", 36)),
+                  (("sender_country", "Land (Ländercode, z. B. DE)", 10), None),
+                  (("sender_email", "E-Mail", 36), ("sender_phone", "Telefon", 36))]
+        for r, pair in enumerate(layout):
+            for c, item in enumerate(pair):
+                if not item:
+                    continue
+                key, label, width = item
+                ttk.Label(g, text=label, style="CardMuted.TLabel").grid(row=2 * r, column=c, sticky="w",
+                                                                        pady=(10 if r else 4, 2), padx=(0, 24))
+                ttk.Entry(g, textvariable=self._var(key), width=width).grid(row=2 * r + 1, column=c, sticky="w",
+                                                                            padx=(0, 24))
 
-    def _pick_shared(self):
-        d = filedialog.askdirectory(parent=self, title="Gemeinsamen Ordner wählen")
-        if d:
-            self.shared_dir.set(os.path.normpath(d))
+    def _p_shipping(self, pg):
+        self._head(pg, "Versandweg", "Über welchen Dienst die Labels erstellt werden. Gilt für alle Arbeitsplätze.",
+                   top=0).destroy()
+        self.carrier = tk.StringVar(value=self.cfg["carrier"])
+        self._cards(pg, self.carrier, [
+            ("sendcloud", "Sendcloud", "Labels über das Sendcloud-Konto, Inland und EU-Ausland."),
+            ("dhl", "DHL direkt", "Über den eigenen DHL-Geschäftskundenvertrag, nur Inland. Zugang im Reiter „DHL“.")])
+        g = self._head(pg, "Sendcloud", "Public und Secret Key aus dem Sendcloud-Konto. Die Schlüssel bleiben "
+                                        "verschlüsselt auf diesem PC.", action=("Verbindung testen", self.test_sendcloud),
+                       top=20)
+        self.pub = tk.StringVar(value=self.cfg.public_key)
+        self.sec = tk.StringVar(value=self.cfg.secret_key)
+        self._row(g, "Public Key", self.pub, width=52)
+        self._row(g, "Secret Key", self.sec, show="•", width=52)
+        self._row(g, "Versandart Inland", self._var("shipping_option_de"), width=52)
+        self._row(g, "Versandart EU-Ausland", self._var("shipping_option_eu"), width=52)
+        self._row(g, "DHL-Vertrags-ID", self._var("contract_id"), width=14)
+        self._row(g, "Brand-ID", self._var("brand_id"), width=14)
 
+    def _p_dhl(self, pg):
+        g = self._head(pg, "Zugang Geschäftskunden",
+                       "API-Key und Secret stammen aus der App im DHL Developer Portal (developer.dhl.com), Benutzer "
+                       "und Passwort aus dem DHL-Geschäftskundenportal (am besten ein Systembenutzer). Die "
+                       "Abrechnungsnummer ist 14-stellig: EKP + 01 (DHL Paket) + Teilnahme.",
+                       action=("Verbindung testen", self.test_dhl), top=0)
+        self.dhl_key, self.dhl_secret, self.dhl_pw = (tk.StringVar(value=v) for v in
+                                                      (self.cfg.dhl_api_key, self.cfg.dhl_api_secret,
+                                                       self.cfg.dhl_password))
+        self._row(g, "API-Key", self.dhl_key)
+        self._row(g, "API-Secret (optional)", self.dhl_secret, show="•")
+        self._row(g, "GKP-Benutzer", self._var("dhl_user"))
+        self._row(g, "Passwort", self.dhl_pw, show="•")
+        self._row(g, "Abrechnungsnummer", self._var("dhl_billing"), width=20)
+        self._row(g, "Gruppenprofil", self._var("dhl_profile"))
+        cols = ttk.Frame(pg, style="Card.TFrame")
+        cols.pack(fill="x", pady=(6, 0))
+        left, right = (ttk.Frame(cols, style="Card.TFrame") for _ in range(2))
+        left.grid(row=0, column=0, sticky="nw", padx=(0, 28))
+        right.grid(row=0, column=1, sticky="nw")
+        for side in (left, right):
+            side.configure(width=370)
+        g = self._head(left, "Sendungsverfolgung", "Leer lassen, wenn der GKP-Benutzer das Recht "
+                                                   "„Sendungsverfolgung“ hat.")
+        self.track_pw = tk.StringVar(value=self.cfg.dhl_track_password)
+        self._row(g, "Benutzer", self._var("dhl_track_user"), width=24, lw=12)
+        self._row(g, "Passwort", self.track_pw, show="•", width=24, lw=12)
+        g = self._head(right, "Label", "910-300-400 = 100 × 150 mm für Etikettendrucker (Zebra), "
+                                       "910-300-300 = A6 für Laserdrucker, „-oz“ = ohne Abziehcodes.")
+        self.vars["dhl_print_format"] = tk.StringVar(value=self.cfg["dhl_print_format"] or "910-300-400")
+        ttk.Label(g, text="Labelformat", style="Card.TLabel", width=12).grid(row=0, column=0, sticky="w", pady=3)
+        ttk.Combobox(g, textvariable=self.vars["dhl_print_format"], values=self.PRINT_FORMATS, width=16,
+                     state="readonly").grid(row=0, column=1, sticky="w")
+        self._check(g, "dhl_sandbox", "Testumgebung (Sandbox), keine echten Labels")
+        for side in (left, right):  # Erklärtexte auf die Spaltenbreite umbrechen
+            for w in side.winfo_children():
+                if isinstance(w, ttk.Label) and str(w.cget("style")) == "CardMuted.TLabel":
+                    w.configure(wraplength=360)
 
-class S4TDialog(tk.Toplevel):
-    FIELDS = [("s4t_host", "Server (Adresse/IP)"), ("s4t_user", "Webservice-Benutzer"),
-              ("s4t_status_id", "Auftragsstatus-ID"), ("s4t_status_extra", "Weitere Status (z. B. 240)"),
-              ("s4t_mandator", "Mandant"),
-              ("s4t_tag", "Nur mit Kennzeichen (optional)")]
-
-    def __init__(self, master, cfg: Config):
-        super().__init__(master)
-        self.cfg = cfg
-        self.title("Speed4Trade-Anbindung")
-        self.resizable(False, False)
-        self.transient(master)
-        f = ttk.Frame(self, padding=14)
-        f.pack(fill="both")
-        ttk.Label(f, text="Abgeholt werden alle Aufträge im angegebenen Status (130 = bezahlt, Versand offen), "
-                          "dazu Shop-Aufträge in den weiteren Status (Komma-getrennt, z. B. 240), solange sie "
-                          "noch nicht versendet sind. Optional lässt sich auf ein Auftragskennzeichen "
-                          "einschränken.", foreground=C["muted"],
-                  wraplength=460).grid(
-            row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
-        self.vars = {}
-        self.pw = tk.StringVar(value=cfg.s4t_password)
-        r = 1
-        for k, label in self.FIELDS:
-            ttk.Label(f, text=label).grid(row=r, column=0, sticky="w", pady=2)
-            self.vars[k] = tk.StringVar(value=cfg[k])
-            ttk.Entry(f, textvariable=self.vars[k], width=40).grid(row=r, column=1, sticky="w", padx=(8, 0))
-            r += 1
-            if k == "s4t_user":
-                ttk.Label(f, text="Passwort").grid(row=r, column=0, sticky="w", pady=2)
-                ttk.Entry(f, textvariable=self.pw, width=40, show="•").grid(row=r, column=1, sticky="w", padx=(8, 0))
-                r += 1
-        r -= 1
-        self.report = tk.BooleanVar(value=cfg["s4t_report"] == "1")
-        ttk.Checkbutton(f, text="Nach dem Senden Sendungsnummer an Speed4Trade melden (Status „versendet“)",
-                        variable=self.report).grid(row=r + 1, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        self.pin = cfg["s4t_cert_sha256"].strip().upper()
-        self.pin_label = ttk.Label(f, text="", foreground=C["muted"])
-        self.pin_label.grid(row=r + 2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+    def _p_s4t(self, pg):
+        g = self._head(pg, "Verbindung", "Webservice von Speed4Trade CONNECT. Passwort und Benutzer bleiben auf "
+                                         "diesem PC.", action=("Verbindung testen", self.test_s4t), top=0)
+        self.s4t_pw = tk.StringVar(value=self.cfg.s4t_password)
+        self._row(g, "Server (Adresse/IP)", self._var("s4t_host"))
+        self._row(g, "Webservice-Benutzer", self._var("s4t_user"))
+        self._row(g, "Passwort", self.s4t_pw, show="•")
+        self._row(g, "Mandant", self._var("s4t_mandator", "1"), width=8)
+        self.pin = self.cfg["s4t_cert_sha256"].strip().upper()
+        self.pin_label = ttk.Label(g, text="", style="CardMuted.TLabel")
+        self.pin_label.grid(row=g.grid_size()[1], column=0, columnspan=3, sticky="w", pady=(4, 0))
         self._show_pin()
-        b = ttk.Frame(f)
-        b.grid(row=r + 3, column=0, columnspan=2, sticky="e", pady=(12, 0))
-        ttk.Button(b, text="Verbindung testen", command=self.test).pack(side="left", padx=(0, 16))
-        ttk.Button(b, text="Speichern", command=self.ok).pack(side="left")
-        ttk.Button(b, text="Abbrechen", command=self.destroy).pack(side="left", padx=(6, 0))
-        self.bind("<Escape>", lambda e: self.destroy())
-        center_over(self, master)
-        self.grab_set()
-        self.wait_window()
+        g = self._head(pg, "Aufträge abholen",
+                       "Abgeholt werden alle Aufträge im Auftragsstatus (130 = bezahlt, Versand offen), dazu "
+                       "Shop-Aufträge in den weiteren Status (Komma-getrennt, z. B. 240), solange sie noch nicht "
+                       "versendet sind. Optional lässt sich auf ein Auftragskennzeichen einschränken.", top=18)
+        self._row(g, "Auftragsstatus-ID", self._var("s4t_status_id", "130"), width=8)
+        self._row(g, "Weitere Status", self._var("s4t_status_extra"), width=20, note="z. B. 240")
+        self._row(g, "Nur mit Kennzeichen", self._var("s4t_tag"), note="optional")
+        self._check(g, "s4t_report", "Nach dem Senden Sendungsnummer an Speed4Trade melden (Status „versendet“)",
+                    )
 
+    def _p_network(self, pg):
+        g = self._head(pg, "Gemeinsamer Ordner", "Für mehrere Arbeitsplätze: Netzwerkordner, auf den alle schreiben "
+                                                 "dürfen (z. B. \\\\server\\freigabe\\Versand). Leer = nur lokal. "
+                                                 "Nach einer Änderung startet das Tool neu.", top=0)
+        self.shared_dir = tk.StringVar(value=self.cfg["shared_dir"])
+        self._folder(g, self.shared_dir)
+        g = self._head(pg, "Updates", f"Installiert ist Version {APP_VERSION}. Neue Versionen werden aus diesem "
+                                      "GitHub-Repository geholt.", action=("Jetzt nach Updates suchen", self._check_now),
+                       top=18)
+        self.update_repo = tk.StringVar(value=self.cfg["update_repo"] or UPDATE_REPO)
+        self._row(g, "Repository (besitzer/repo)", self.update_repo, width=40)
+
+    def _p_colors(self, pg):
+        self._head(pg, "Farbschema", "Gilt nur für diesen Arbeitsplatz. Zum Übernehmen startet das Tool kurz neu.",
+                   top=0).destroy()
+        self.theme = tk.StringVar(value=self.cfg["color_theme"] if self.cfg["color_theme"] in THEMES else "Standard")
+        row = ttk.Frame(pg, style="Card.TFrame")
+        row.pack(fill="x", pady=(8, 0))
+        self.theme_tiles = {}
+        for i, name in enumerate(THEMES):
+            pal = build_palette(name)
+            tile = tk.Frame(row, bg=C["paper"], highlightthickness=2, cursor="hand2", padx=6, pady=6)
+            tile.grid(row=0, column=i, padx=(0, 10))
+            sw = tk.Canvas(tile, width=92, height=40, highlightthickness=0, bg=pal["hall"], cursor="hand2")
+            sw.create_rectangle(0, 0, 93, 13, fill=pal["steel"], width=0)
+            sw.create_rectangle(62, 3, 88, 10, fill=pal["signal"], width=0)
+            sw.create_rectangle(6, 19, 86, 27, fill=pal["paper"], width=0)
+            sw.create_rectangle(6, 30, 86, 38, fill=pal["select"], width=0)
+            sw.pack()
+            lab = tk.Label(tile, text=name, bg=C["paper"], fg=C["ink"], font=F["small"], cursor="hand2")
+            lab.pack(pady=(4, 0))
+            for w in (tile, sw, lab):
+                w.bind("<Button-1>", lambda e, n=name: (self.theme.set(n), self._preview()))
+            self.theme_tiles[name] = tile
+        cols = ttk.Frame(pg, style="Card.TFrame")
+        cols.pack(fill="x", pady=(4, 0))
+        left = ttk.Frame(cols, style="Card.TFrame")
+        left.grid(row=0, column=0, sticky="nw", padx=(0, 28))
+        right = ttk.Frame(cols, style="Card.TFrame")
+        right.grid(row=0, column=1, sticky="nwe")
+        cols.columnconfigure(1, weight=1)
+        g = self._head(left, "Eigene Farben", top=18)
+        self.custom = {"color_bar": tk.StringVar(value=self.cfg["color_bar"]),
+                       "color_accent": tk.StringVar(value=self.cfg["color_accent"])}
+        self.swatches = {}
+        for key, label in (("color_bar", "Leiste oben"), ("color_accent", "Akzent (Knöpfe, Auswahl)")):
+            line = ttk.Frame(g, style="Card.TFrame")
+            line.pack(anchor="w", pady=(8, 3))
+            sw = tk.Label(line, width=3, highlightthickness=1, highlightbackground=C["line_strong"], cursor="hand2")
+            sw.pack(side="left")
+            sw.bind("<Button-1>", lambda e, k=key: self._pick(k))
+            self.swatches[key] = sw
+            ttk.Label(line, text=label, style="Card.TLabel").pack(side="left", padx=(8, 0))
+            bf = ttk.Frame(g, style="Card.TFrame")
+            bf.pack(anchor="w")
+            ttk.Button(bf, text="Wählen…", command=lambda k=key: self._pick(k)).pack(side="left")
+            ttk.Button(bf, text="Aus Schema", command=lambda k=key: self._reset(k)).pack(side="left", padx=(4, 0))
+        self._head(right, "Vorschau", top=18).destroy()
+        self.prev = tk.Frame(right, highlightthickness=1, highlightbackground=C["line"])
+        self.prev.pack(fill="x", pady=(6, 0))
+        self._preview()
+
+    # ----- Darstellung
+    def _palette(self):
+        return build_palette(self.theme.get(), self.custom["color_bar"].get(), self.custom["color_accent"].get())
+
+    def _pick(self, key):
+        from tkinter import colorchooser
+        pal = self._palette()
+        rgb, hx = colorchooser.askcolor(color=pal["steel" if key == "color_bar" else "signal"], parent=self,
+                                        title="Leistenfarbe wählen" if key == "color_bar" else "Akzentfarbe wählen")
+        if hx:
+            self.custom[key].set(hx.upper())
+            self._preview()
+
+    def _reset(self, key):
+        self.custom[key].set("")
+        self._preview()
+
+    def _preview(self):
+        pal = self._palette()
+        for name, tile in self.theme_tiles.items():
+            on = name == self.theme.get()
+            tile.configure(highlightbackground=C["signal"] if on else C["paper"],
+                           highlightcolor=C["signal"] if on else C["paper"])
+        for key, sw in self.swatches.items():
+            sw.configure(bg=pal["steel" if key == "color_bar" else "signal"])
+        for w in self.prev.winfo_children():
+            w.destroy()
+        bar = tk.Frame(self.prev, bg=pal["steel"], padx=12, pady=8)
+        bar.pack(fill="x")
+        tk.Label(bar, text=APP_NAME, bg=pal["steel"], fg=pal["on_steel"], font=F["section"]).pack(side="left")
+        tk.Label(bar, text="Ausgewählte senden", bg=pal["signal"], fg=pal["on_signal"], font=F["row_button"],
+                 padx=10, pady=3).pack(side="right")
+        body = tk.Frame(self.prev, bg=pal["hall"], padx=10, pady=8)
+        body.pack(fill="x")
+        for text, bg, fg in (("50100   Kunde 0   Aachen", pal["paper"], pal["ink"]),
+                             ("50101   Kunde 1   (markiert)", pal["select"], pal["on_select"]),
+                             ("50102   Kunde 2   versendet", pal["green_bg"], pal["green_ink"]),
+                             ("50103   Kunde 3   bitte prüfen", pal["amber_bg"], pal["amber_ink"])):
+            row = tk.Frame(body, bg=bg)
+            row.pack(fill="x")
+            tk.Label(row, text="Senden  ›", bg=pal["signal"], fg=pal["on_signal"], font=F["row_button"],
+                     padx=8).pack(side="left", padx=6, pady=3)
+            tk.Label(row, text=text, bg=bg, fg=fg, font=F["small"]).pack(side="left", padx=6)
+
+    # ----- Speed4Trade-Zertifikat
     def _show_pin(self):
         self.pin_label.configure(text=f"Server-Zertifikat bestätigt: {self.pin[:8]}…{self.pin[-8:]}" if self.pin
-                                 else "Server-Zertifikat noch nicht bestätigt – „Verbindung testen“ klicken.")
-
-    def _apply(self, cfg):
-        for k, v in self.vars.items():
-            cfg[k] = v.get().strip()
-        cfg.s4t_password = self.pw.get()
-        cfg["s4t_report"] = "1" if self.report.get() else "0"
-        cfg["s4t_cert_sha256"] = self.pin
+                                 else "Server-Zertifikat noch nicht bestätigt, „Verbindung testen“ klicken.")
 
     def _confirm_cert(self):
         """Fingerabdruck abrufen (ohne Zugangsdaten) und bei neuem/geändertem Zertifikat bestätigen lassen."""
@@ -4584,148 +4726,127 @@ class S4TDialog(tk.Toplevel):
         self._show_pin()
         return True
 
-    def test(self):
-        if not self._confirm_cert():
-            return
-        tmp = Config.__new__(Config)  # Kopie: Test ohne die gespeicherten Einstellungen zu ändern
-        tmp.cp = configparser.ConfigParser()
-        tmp.cp.read_dict(self.cfg.cp)
-        self._apply(tmp)
-        self.configure(cursor="watch")
-        self.update()
-        try:
-            mandators = S4T(tmp).test()
-            messagebox.showinfo(APP_NAME, "Verbindung zu Speed4Trade erfolgreich.\n\nMandanten:\n"
-                                + "\n".join(f"{i}: {n}" for i, n in mandators), parent=self)
-        except Exception as e:
-            messagebox.showerror(APP_NAME, str(e), parent=self)
-        finally:
-            self.configure(cursor="")
+    # ----- Tests
+    def test_sendcloud(self):
+        tmp = self._scratch()
+        self._busy_test(lambda: Sendcloud(tmp).test(), "Verbindung zu Sendcloud erfolgreich.")
 
-    def ok(self):
-        for k in ("s4t_status_id", "s4t_mandator"):
-            if not self.vars[k].get().strip().isdigit():
-                messagebox.showerror(APP_NAME, "Status-ID und Mandant müssen Zahlen sein.", parent=self)
-                return
-        if not all(v.isdigit() for v in re.split(r"[,;\s]+", self.vars["s4t_status_extra"].get().strip()) if v):
-            messagebox.showerror(APP_NAME, "Weitere Status: nur Zahlen, durch Komma getrennt (z. B. 240).",
-                                 parent=self)
-            return
-        if self.vars["s4t_host"].get().strip() and not self.pin and not self._confirm_cert():
-            return
-        self._apply(self.cfg)
-        self.cfg.save()
-        if BACKEND is not None:
-            try:
-                BACKEND.put_settings({k: self.cfg[k] for k in SHARED_SETTINGS})
-            except OSError as e:
-                messagebox.showwarning(APP_NAME, f"Lokal gespeichert, aber nicht im gemeinsamen Ordner:\n{e}",
-                                       parent=self)
-        self.destroy()
-
-
-class DHLDialog(tk.Toplevel):
-    FIELDS = [("dhl_user", "GKP-Benutzer"), ("dhl_billing", "Abrechnungsnummer DHL Paket"),
-              ("dhl_profile", "Gruppenprofil")]
-    PRINT_FORMATS = ("910-300-400", "910-300-300-oz", "910-300-300", "910-300-600", "910-300-700-oz", "910-300-700", "A4")
-
-    def __init__(self, master, cfg: Config):
-        super().__init__(master)
-        self.cfg = cfg
-        self.title("DHL-Zugang (Geschäftskunden)")
-        self.resizable(False, False)
-        self.transient(master)
-        f = ttk.Frame(self, padding=14)
-        f.pack(fill="both")
-        ttk.Label(f, text="API-Key und Secret stammen aus der App im DHL Developer Portal (developer.dhl.com), "
-                          "Benutzer und Passwort aus dem DHL-Geschäftskundenportal (am besten ein Systembenutzer). "
-                          "Die Abrechnungsnummer ist 14-stellig: EKP + 01 (DHL Paket) + Teilnahme.",
-                  foreground=C["muted"], wraplength=470).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
-        self.key, self.secret, self.pw = (tk.StringVar(value=v) for v in
-                                          (cfg.dhl_api_key, cfg.dhl_api_secret, cfg.dhl_password))
-        rows = [("API-Key", self.key, ""), ("API-Secret (optional)", self.secret, "•")]
-        self.vars = {k: tk.StringVar(value=cfg[k]) for k, _ in self.FIELDS}
-        rows += [(self.FIELDS[0][1], self.vars["dhl_user"], ""), ("Passwort", self.pw, "•"),
-                 (self.FIELDS[1][1], self.vars["dhl_billing"], ""), (self.FIELDS[2][1], self.vars["dhl_profile"], "")]
-        for r, (label, var, show) in enumerate(rows, 1):
-            ttk.Label(f, text=label).grid(row=r, column=0, sticky="w", pady=2)
-            ttk.Entry(f, textvariable=var, width=40, show=show).grid(row=r, column=1, sticky="w", padx=(8, 0))
-        r = len(rows) + 1
-        ttk.Label(f, text="Sendungsverfolgung – leer lassen, wenn der GKP-Benutzer oben das Recht "
-                          "„Sendungsverfolgung“ hat:", foreground=C["muted"], wraplength=470).grid(
-            row=r, column=0, columnspan=2, sticky="w", pady=(10, 2))
-        self.track_user = tk.StringVar(value=cfg["dhl_track_user"])
-        self.track_pw = tk.StringVar(value=cfg.dhl_track_password)
-        for label, var, show in (("Benutzer Verfolgung", self.track_user, ""), ("Passwort Verfolgung", self.track_pw, "•")):
-            r += 1
-            ttk.Label(f, text=label).grid(row=r, column=0, sticky="w", pady=2)
-            ttk.Entry(f, textvariable=var, width=40, show=show).grid(row=r, column=1, sticky="w", padx=(8, 0))
-        r += 1
-        ttk.Label(f, text="Labelformat").grid(row=r, column=0, sticky="w", pady=(10, 2))
-        self.fmt = tk.StringVar(value=cfg["dhl_print_format"] or "910-300-400")
-        ttk.Combobox(f, textvariable=self.fmt, values=self.PRINT_FORMATS, width=14, state="readonly").grid(
-            row=r, column=1, sticky="w", padx=(8, 0))
-        ttk.Label(f, text="910-300-400 = 100 × 150 mm für Etikettendrucker (Zebra)\n"
-                          "910-300-300 = A6 für Laserdrucker, „-oz“ = ohne Abziehcodes", foreground=C["muted"]).grid(
-            row=r + 1, column=1, sticky="w", padx=(8, 0))
-        self.sandbox = tk.BooleanVar(value=cfg["dhl_sandbox"] == "1")
-        ttk.Checkbutton(f, text="Testumgebung (Sandbox) – keine echten Labels, nur API-Key nötig",
-                        variable=self.sandbox).grid(row=r + 2, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        b = ttk.Frame(f)
-        b.grid(row=r + 3, column=0, columnspan=2, sticky="e", pady=(12, 0))
-        ttk.Button(b, text="Verbindung testen", command=self.test).pack(side="left", padx=(0, 16))
-        ttk.Button(b, text="Speichern", command=self.ok).pack(side="left")
-        ttk.Button(b, text="Abbrechen", command=self.destroy).pack(side="left", padx=(6, 0))
-        self.bind("<Escape>", lambda e: self.destroy())
-        center_over(self, master)
-        self.grab_set()
-        self.wait_window()
-
-    def _apply(self, cfg):
-        for k, v in self.vars.items():
-            cfg[k] = v.get().strip().replace(" ", "") if k == "dhl_billing" else v.get().strip()
-        cfg.set_dhl(self.key.get(), self.secret.get(), self.pw.get())
-        cfg["dhl_print_format"] = self.fmt.get()
-        cfg["dhl_sandbox"] = "1" if self.sandbox.get() else "0"
-        cfg["dhl_track_user"] = self.track_user.get().strip()
-        cfg.dhl_track_password = self.track_pw.get()
-
-    def test(self):
-        tmp = Config.__new__(Config)  # Kopie: Test ohne die gespeicherten Einstellungen zu ändern
-        tmp.cp = configparser.ConfigParser()
-        tmp.cp.read_dict(self.cfg.cp)
-        self._apply(tmp)
+    def test_dhl(self):
+        tmp = self._scratch()
         tmp["carrier"] = "dhl"
         if tmp.carrier_missing:
             messagebox.showerror(APP_NAME, "Es fehlt:\n\n• " + "\n• ".join(tmp.carrier_missing), parent=self)
             return
-        self.configure(cursor="watch")
-        self.update()
-        try:
+
+        def run():
             DHL(tmp).test()
-            messagebox.showinfo(APP_NAME, "Verbindung zu DHL erfolgreich – Probe-Sendung an die eigene Adresse wurde "
-                                          "geprüft (nicht angelegt)."
-                                + ("\n\nAchtung: Testumgebung aktiv." if tmp["dhl_sandbox"] == "1" else ""), parent=self)
-        except Exception as e:
-            messagebox.showerror(APP_NAME, str(e), parent=self)
-        finally:
-            self.configure(cursor="")
+            return "\n\nAchtung: Testumgebung aktiv." if tmp["dhl_sandbox"] == "1" else ""
+        self._busy_test(run, "Verbindung zu DHL erfolgreich – Probe-Sendung an die eigene Adresse wurde geprüft "
+                             "(nicht angelegt).")
+
+    def test_s4t(self):
+        if not self._confirm_cert():
+            return
+        tmp = self._scratch()
+        self._busy_test(lambda: "\n\nMandanten:\n" + "\n".join(f"{i}: {n}" for i, n in S4T(tmp).test()),
+                        "Verbindung zu Speed4Trade erfolgreich.")
+
+    # ----- Übernehmen
+    def _apply(self, cfg):
+        for k, v in self.vars.items():
+            cfg[k] = v.get().strip().replace(" ", "") if k == "dhl_billing" else v.get().strip()
+        for k, v in self.flags.items():
+            cfg[k] = "1" if v.get() else "0"
+        cfg["carrier"] = self.carrier.get()
+        cfg.set_keys(self.pub.get(), self.sec.get())
+        cfg.set_dhl(self.dhl_key.get(), self.dhl_secret.get(), self.dhl_pw.get())
+        cfg.dhl_track_password = self.track_pw.get()
+        cfg.s4t_password = self.s4t_pw.get()
+        cfg["s4t_cert_sha256"] = self.pin
+        cfg["shared_dir"] = self.shared_dir.get().strip()
+        cfg["update_repo"] = self._repo()
+        cfg["color_theme"] = self.theme.get()
+        for k, v in self.custom.items():
+            cfg[k] = v.get()
+
+    def _repo(self):
+        repo = self.update_repo.get().strip().strip("/")
+        repo = re.sub(r"^https?://github\.com/", "", repo)  # auch komplette GitHub-Adresse akzeptieren
+        return "" if repo == UPDATE_REPO else repo
+
+    def _problem(self):
+        """Erste ungültige Eingabe als (Reiter, Meldung), sonst None."""
+        v = lambda k: self.vars[k].get().strip()
+        if _num(v("default_weight_kg")) is None:
+            return "Allgemein", "Standardgewicht ist keine Zahl."
+        for k, name in (("contract_id", "DHL-Vertrags-ID"), ("brand_id", "Brand-ID")):
+            if v(k) and not v(k).isdigit():
+                return "Versand", f"{name} muss eine Zahl sein."
+        billing = v("dhl_billing").replace(" ", "")
+        if billing and not re.fullmatch(r"\w{10}\d{2}\w{2}", billing):
+            return "DHL", "Die Abrechnungsnummer muss 14 Stellen haben (EKP + 01 + Teilnahme)."
+        if not (v("s4t_status_id").isdigit() and v("s4t_mandator").isdigit()):
+            return "Speed4Trade", "Auftragsstatus-ID und Mandant müssen Zahlen sein."
+        if not all(x.isdigit() for x in re.split(r"[,;\s]+", v("s4t_status_extra")) if x):
+            return "Speed4Trade", "Weitere Status: nur Zahlen, durch Komma getrennt (z. B. 240)."
+        new_shared = self.shared_dir.get().strip()
+        if new_shared and new_shared != self.cfg["shared_dir"].strip():
+            try:  # Schreibrecht prüfen, bevor der Ordner übernommen wird
+                os.makedirs(new_shared, exist_ok=True)
+                probe = os.path.join(new_shared, f".schreibtest_{USER}.tmp")
+                with open(probe, "w") as fh:
+                    fh.write("ok")
+                os.remove(probe)
+            except OSError as e:
+                return "Arbeitsplätze", f"In diesen Ordner kann nicht geschrieben werden:\n{new_shared}\n\n{e}"
+        return None
 
     def ok(self):
-        billing = self.vars["dhl_billing"].get().strip().replace(" ", "")
-        if billing and not re.fullmatch(r"\w{10}\d{2}\w{2}", billing):
-            messagebox.showerror(APP_NAME, "Die Abrechnungsnummer muss 14 Stellen haben (EKP + 01 + Teilnahme).",
-                                 parent=self)
-            return
+        problem = self._problem()
+        if problem:
+            self.tabs.select(problem[0])
+            messagebox.showerror(APP_NAME, problem[1], parent=self)
+            return False
+        if self.vars["s4t_host"].get().strip() and not self.pin:
+            self.tabs.select("Speed4Trade")
+            if not self._confirm_cert():
+                return False
+        colors = any(self.cfg[k] != v for k, v in (("color_theme", self.theme.get()),
+                                                   *((k, v.get()) for k, v in self.custom.items())))
+        shared_changed = self.shared_dir.get().strip() != self.cfg["shared_dir"].strip()
         self._apply(self.cfg)
         self.cfg.save()
-        if BACKEND is not None:
+        if BACKEND is not None and not shared_changed:
             try:
                 BACKEND.put_settings({k: self.cfg[k] for k in SHARED_SETTINGS})
             except OSError as e:
-                messagebox.showwarning(APP_NAME, f"Lokal gespeichert, aber nicht im gemeinsamen Ordner:\n{e}",
-                                       parent=self)
+                messagebox.showwarning(APP_NAME, f"Einstellungen lokal gespeichert, aber nicht im gemeinsamen "
+                                                 f"Ordner:\n{e}", parent=self)
         self.destroy()
+        if colors or shared_changed:
+            self._root().restart_pending = True  # App.settings() startet nach dem Fenster neu
+            what = " und ".join(w for w, on in (("die neuen Farben", colors),
+                                                ("der gemeinsame Ordner", shared_changed)) if on)
+            messagebox.showinfo(APP_NAME, f"Das Tool startet jetzt kurz neu, damit {what} übernommen werden.",
+                                parent=self.master)
+        return True
+
+    def _check_now(self):
+        self.cfg["update_repo"] = self._repo()
+        self.cfg.save()
+        self.master.check_updates(manual=True)
+
+    def reload_hist(self):
+        if self.ok():
+            self.master.reload_history(notify=True)
+
+    def open_log(self):
+        if BACKEND is not None:
+            os.startfile(BACKEND.dirs["protokoll"])
+        elif os.path.exists(LOG_PATH):
+            os.startfile(LOG_PATH)
+        else:
+            messagebox.showinfo(APP_NAME, "Noch kein Protokoll vorhanden.", parent=self)
 
 
 TRACK_FILTERS = ["Alle", "Probleme", "Unterwegs", "Zugestellt"]
@@ -4958,115 +5079,6 @@ class TrackingWindow(tk.Toplevel):
         m.add_command(label="Bei DHL öffnen", command=self.open_dhl)
         m.add_command(label="Sendungsnummer kopieren", command=self.copy_number)
         m.tk_popup(e.x_root, e.y_root)
-
-
-class ColorDialog(tk.Toplevel):
-    """Farbschema und eigene Farben für diesen Arbeitsplatz, mit Vorschau. Übernommen wird beim Neustart."""
-
-    def __init__(self, master, cfg: Config):
-        super().__init__(master)
-        self.cfg = cfg
-        self.title("Farben")
-        self.resizable(False, False)
-        self.transient(master)
-        f = ttk.Frame(self, padding=14)
-        f.pack(fill="both")
-        ttk.Label(f, text="Farbschema", font=F["section"]).grid(row=0, column=0, columnspan=3, sticky="w")
-        self.theme = tk.StringVar(value=cfg["color_theme"] if cfg["color_theme"] in THEMES else "Standard")
-        for r, name in enumerate(THEMES, 1):
-            pal = build_palette(name)
-            sw = tk.Canvas(f, width=46, height=18, highlightthickness=1, highlightbackground=C["line_strong"],
-                           bg=pal["steel"])
-            sw.create_rectangle(30, 0, 47, 19, fill=pal["signal"], width=0)
-            sw.grid(row=r, column=0, sticky="w", pady=2)
-            ttk.Radiobutton(f, text=name, value=name, variable=self.theme, command=self._preview).grid(
-                row=r, column=1, columnspan=2, sticky="w", padx=(8, 0))
-        r = len(THEMES) + 1
-        ttk.Label(f, text="Eigene Farben (optional)", font=F["section"]).grid(
-            row=r, column=0, columnspan=3, sticky="w", pady=(14, 2))
-        self.custom = {"color_bar": tk.StringVar(value=cfg["color_bar"]),
-                       "color_accent": tk.StringVar(value=cfg["color_accent"])}
-        self.swatches = {}
-        for key, label in (("color_bar", "Leiste oben"), ("color_accent", "Akzent (Knöpfe, Auswahl)")):
-            r += 1
-            sw = tk.Label(f, width=5, relief="flat", highlightthickness=1, highlightbackground=C["line_strong"],
-                          cursor="hand2")
-            sw.grid(row=r, column=0, sticky="w", pady=2)
-            sw.bind("<Button-1>", lambda e, k=key: self._pick(k))
-            self.swatches[key] = sw
-            ttk.Label(f, text=label).grid(row=r, column=1, sticky="w", padx=(8, 12))
-            bf = ttk.Frame(f)
-            bf.grid(row=r, column=2, sticky="w")
-            ttk.Button(bf, text="Wählen…", command=lambda k=key: self._pick(k)).pack(side="left")
-            ttk.Button(bf, text="Aus Schema", command=lambda k=key: self._reset(k)).pack(side="left", padx=(4, 0))
-        r += 1
-        ttk.Label(f, text="Vorschau", font=F["section"]).grid(row=r, column=0, columnspan=3, sticky="w", pady=(14, 4))
-        self.prev = tk.Frame(f, highlightthickness=1, highlightbackground=C["line_strong"])
-        self.prev.grid(row=r + 1, column=0, columnspan=3, sticky="we")
-        ttk.Label(f, text="Gilt nur für diesen Arbeitsplatz. Das Tool startet zum Übernehmen neu.",
-                  foreground=C["muted"]).grid(row=r + 2, column=0, columnspan=3, sticky="w", pady=(10, 0))
-        b = ttk.Frame(f)
-        b.grid(row=r + 3, column=0, columnspan=3, sticky="e", pady=(12, 0))
-        ttk.Button(b, text="Übernehmen", command=self.ok).pack(side="left")
-        ttk.Button(b, text="Abbrechen", command=self.destroy).pack(side="left", padx=(6, 0))
-        self.bind("<Escape>", lambda e: self.destroy())
-        self._preview()
-        center_over(self, master)
-        self.grab_set()
-        self.wait_window()
-
-    def _palette(self):
-        return build_palette(self.theme.get(), self.custom["color_bar"].get(), self.custom["color_accent"].get())
-
-    def _pick(self, key):
-        from tkinter import colorchooser
-        pal = self._palette()
-        rgb, hx = colorchooser.askcolor(color=pal["steel" if key == "color_bar" else "signal"], parent=self,
-                                        title="Leistenfarbe wählen" if key == "color_bar" else "Akzentfarbe wählen")
-        if hx:
-            self.custom[key].set(hx.upper())
-            self._preview()
-
-    def _reset(self, key):
-        self.custom[key].set("")
-        self._preview()
-
-    def _preview(self):
-        pal = self._palette()
-        for key, sw in self.swatches.items():
-            sw.configure(bg=pal["steel" if key == "color_bar" else "signal"])
-        for w in self.prev.winfo_children():
-            w.destroy()
-        bar = tk.Frame(self.prev, bg=pal["steel"], padx=12, pady=8)
-        bar.pack(fill="x")
-        tk.Label(bar, text=APP_NAME, bg=pal["steel"], fg=pal["on_steel"], font=F["brand"]).pack(side="left")
-        tk.Label(bar, text="Aus S4T abholen", bg=pal["steel"], fg=pal["steel_text"], font=F["button"]).pack(
-            side="left", padx=(16, 0))
-        tk.Label(bar, text="Ausgewählte senden", bg=pal["signal"], fg=pal["on_signal"], font=F["button"],
-                 padx=12, pady=4).pack(side="right")
-        body = tk.Frame(self.prev, bg=pal["hall"], padx=12, pady=10)
-        body.pack(fill="x")
-        for text, bg, fg in (("50100   Kunde 0   Aachen", pal["paper"], pal["ink"]),
-                             ("50101   Kunde 1   Aachen   (markiert)", pal["select"], pal["on_select"]),
-                             ("50102   Kunde 2   versendet", pal["green_bg"], pal["green_ink"]),
-                             ("50103   Kunde 3   bitte prüfen", pal["amber_bg"], pal["amber_ink"])):
-            row = tk.Frame(body, bg=bg)
-            row.pack(fill="x")
-            tk.Label(row, text="Senden  ›", bg=pal["signal"], fg=pal["on_signal"], font=F["row_button"],
-                     padx=8).pack(side="left", padx=6, pady=4)
-            tk.Label(row, text=text, bg=bg, fg=fg, font=F["body"]).pack(side="left", padx=6)
-
-    def ok(self):
-        new = {"color_theme": self.theme.get(), **{k: v.get() for k, v in self.custom.items()}}
-        changed = any(self.cfg[k] != v for k, v in new.items())
-        for k, v in new.items():
-            self.cfg[k] = v
-        self.cfg.save()
-        self.destroy()
-        if changed:
-            self._root().restart_pending = True
-            messagebox.showinfo(APP_NAME, "Die neuen Farben erscheinen, sobald du das Einstellungsfenster schließt "
-                                          "– das Tool startet dafür kurz neu.", parent=self.master)
 
 
 def selftest(path):
