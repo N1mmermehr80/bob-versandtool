@@ -90,6 +90,9 @@ DEFAULTS = {
     "dhl_profile": "STANDARD_GRUPPENPROFIL",
     "dhl_print_format": "910-300-400",  # 100 × 150 mm, Thermodruck (Zebra), randlos
     "dhl_track_user": "",      # GKP-Benutzer mit Recht „Sendungsverfolgung“ (leer = dhl_user), Passwort verschlüsselt
+    "color_theme": "Standard",  # Farbschema (THEMES), pro PC
+    "color_bar": "",           # eigene Leistenfarbe #RRGGBB (leer = aus dem Schema)
+    "color_accent": "",        # eigene Akzentfarbe #RRGGBB (leer = aus dem Schema)
 }
 
 # Diese Einstellungen gelten für alle Arbeitsplätze (im gemeinsamen Ordner); Zugangsdaten bleiben pro PC.
@@ -2005,6 +2008,7 @@ class App(tk.Tk):
         self.geometry("1500x760")
         self.minsize(1000, 500)
         self.cfg = Config()
+        apply_colors(self.cfg)
         self.orders = []
         self.source = ""
         self.deleted = {}            # Auftragsnummer -> Zeitpunkt, aus der Liste gelöscht
@@ -2041,7 +2045,7 @@ class App(tk.Tk):
         # ── Kopfleiste (Graphit) mit Aktionen
         bar = tk.Frame(self, bg=C["steel"], padx=14, pady=10)
         bar.pack(fill="x")
-        tk.Label(bar, text=APP_NAME, bg=C["steel"], fg="white", font=F["brand"]).pack(side="left", padx=(0, 22))
+        tk.Label(bar, text=APP_NAME, bg=C["steel"], fg=C["on_steel"], font=F["brand"]).pack(side="left", padx=(0, 22))
         self.btn_s4t = FlatButton(bar, "Aus S4T abholen", self.fetch_s4t, "bar")
         self.btn_s4t.pack(side="left")
         self.btn_open = FlatButton(bar, "CSV importieren…", self.open_file, "bar")
@@ -2082,7 +2086,7 @@ class App(tk.Tk):
                                      cursor="hand2", padx=10)
         self.update_later.pack(side="right")
         self.update_later.bind("<Button-1>", lambda e: self.update_bar.pack_forget())
-        self.update_btn = tk.Label(self.update_bar, text="Jetzt aktualisieren", bg=C["steel"], fg="white",
+        self.update_btn = tk.Label(self.update_bar, text="Jetzt aktualisieren", bg=C["steel"], fg=C["on_steel"],
                                    font=F["button"], cursor="hand2", padx=14, pady=4)
         self.update_btn.pack(side="right", padx=(0, 6))
         self.update_btn.bind("<Button-1>", lambda e: self.do_update())
@@ -2092,7 +2096,7 @@ class App(tk.Tk):
         sbar = tk.Frame(self, bg=C["hall"], padx=14, pady=10)
         sbar.pack(fill="x")
         box = tk.Frame(sbar, bg=C["paper"], highlightthickness=1, highlightbackground=C["line_strong"],
-                       highlightcolor=C["steel"])
+                       highlightcolor=C["focus"])
         box.grid(row=0, column=0, sticky="w")
         tk.Label(box, text="⌕", bg=C["paper"], fg=C["muted"], font=(F["body"][0], 13)).pack(side="left", padx=(8, 2))
         self.search = tk.StringVar()
@@ -2105,7 +2109,7 @@ class App(tk.Tk):
         self.search_clear.bind("<Button-1>", lambda e: (self.search.set(""), self.search_entry.focus_set()))
         self.search_ph = Placeholder(self.search_entry, "Auftrag, Name, Artikel suchen …")
         box.bind("<Button-1>", lambda e: self.search_entry.focus_set())
-        self.search_entry.bind("<FocusIn>", lambda e: box.configure(highlightbackground=C["steel"]), add="+")
+        self.search_entry.bind("<FocusIn>", lambda e: box.configure(highlightbackground=C["focus"]), add="+")
         self.search_entry.bind("<FocusOut>", lambda e: box.configure(highlightbackground=C["line_strong"]), add="+")
 
         self.filter = tk.StringVar(value=FILTERS[0])
@@ -2514,7 +2518,7 @@ class App(tk.Tk):
         elif o.needs_review:
             badge = ("bitte prüfen", C["amber_ink"], C["amber_bg"])
         else:
-            badge = ("bereit zum Senden", C["steel"], C["hall"])
+            badge = ("bereit zum Senden", C["ink"], C["hall"])
         self.det_badge.configure(text=badge[0], fg=badge[1], bg=badge[2])
 
         # Empfänger
@@ -2904,6 +2908,22 @@ class App(tk.Tk):
 
     def settings(self):
         SettingsDialog(self, self.cfg)
+        if getattr(self, "restart_pending", False):  # neue Farben gewählt, erst nach dem Einstellungsfenster
+            self.restart_pending = False
+            self.restart()
+
+    def restart(self):
+        """Tool beenden und neu starten (z. B. für ein anderes Farbschema)."""
+        if self.busy:
+            messagebox.showinfo(APP_NAME, "Es läuft gerade ein Vorgang. Die neuen Farben erscheinen nach dem "
+                                          "nächsten Start.")
+            return
+        import subprocess
+        self.save_session()
+        env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")
+        cmd = [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, os.path.abspath(__file__)]
+        subprocess.Popen(cmd, close_fds=True, env=env)
+        self.destroy()
 
     def send_selected(self):
         if self.busy:
@@ -3746,6 +3766,64 @@ C = {
     "blue_bg": "#E4EDF7", "blue_ink": "#24538A",
     "violet_bg": "#EEE8F8", "violet_ink": "#5B3FA8",
 }
+# Farbschemata (pro Arbeitsplatz): Leiste und Akzent genügen, Hover-, Linien- und Textfarben werden abgeleitet.
+# „Dunkel“ ersetzt zusätzlich die Flächen und die Statusfarben.
+THEMES = {
+    "Standard": {"steel": "#22303C", "signal": "#F5B700"},
+    "Marine": {"steel": "#1B3A5C", "signal": "#F28C28"},
+    "Waldgrün": {"steel": "#1F4034", "signal": "#E9C46A"},
+    "Bordeaux": {"steel": "#4A1F2A", "signal": "#E8B04B"},
+    "Hell": {"steel": "#DDE3EA", "signal": "#2F6FDE", "select": "#CFE0FA"},
+    "Dunkel": {"steel": "#0D1115", "signal": "#F5B700", "select": "#2C4760",
+               "hall": "#161B21", "paper": "#1F262E", "ink": "#E6EBF0", "muted": "#9AA7B4", "faint": "#6B7884",
+               "line": "#2C353F", "line_strong": "#3E4955", "hover": "#29323C",
+               "amber_bg": "#3A2F12", "amber_ink": "#F0C36A", "red_bg": "#3D2321", "red_ink": "#F2A49C",
+               "green_bg": "#1C3325", "green_ink": "#8FD4A8", "blue_bg": "#1D2B3D", "blue_ink": "#9DC1EB",
+               "violet_bg": "#2B2440", "violet_ink": "#C2B1F0"},
+}
+BASE_C = dict(C)
+_HEX_RX = re.compile(r"#[0-9A-Fa-f]{6}")
+
+
+def _mix(a, b, t):
+    """Farbe a um den Anteil t in Richtung b verschieben."""
+    ca, cb = (tuple(int(h[i:i + 2], 16) for i in (1, 3, 5)) for h in (a, b))
+    return "#" + "".join(f"{round(x + (y - x) * t):02X}" for x, y in zip(ca, cb))
+
+
+def _light(h):
+    r, g, b = (int(h[i:i + 2], 16) / 255 for i in (1, 3, 5))
+    return 0.299 * r + 0.587 * g + 0.114 * b > 0.6
+
+
+def build_palette(theme="Standard", bar="", accent=""):
+    """Vollständige Farbtabelle für ein Schema, optional mit eigener Leisten- und Akzentfarbe."""
+    pal = {**BASE_C, **THEMES.get(theme, {})}
+    if _HEX_RX.fullmatch(bar or ""):
+        pal["steel"] = bar.upper()
+        pal.pop("select", None)
+    if _HEX_RX.fullmatch(accent or ""):
+        pal["signal"] = accent.upper()
+    # markierte Zeile: Leistenfarbe, bei heller Leiste eine helle Abstufung des Akzents
+    pal.setdefault("select", _mix(pal["signal"], pal["paper"], 0.72) if _light(pal["steel"]) else pal["steel"])
+    dark_ink = BASE_C["ink"]
+    pal["on_steel"] = dark_ink if _light(pal["steel"]) else "#FFFFFF"
+    pal["steel_text"] = _mix(pal["steel"], pal["on_steel"], 0.82)
+    pal["steel_hover"] = _mix(pal["steel"], pal["on_steel"], 0.10)
+    pal["steel_line"] = _mix(pal["steel"], pal["on_steel"], 0.20)
+    pal["on_select"] = dark_ink if _light(pal["select"]) else "#FFFFFF"
+    pal["on_signal"] = dark_ink if _light(pal["signal"]) else "#FFFFFF"
+    pal["signal_hover"] = _mix(pal["signal"], "#FFFFFF", 0.15)
+    pal["signal_edge"] = _mix(pal["signal"], "#000000", 0.13)
+    # Fokusrahmen: Leistenfarbe, solange sie sich von den Flächen abhebt, sonst Akzent
+    pal["focus"] = pal["steel"] if _light(pal["paper"]) != _light(pal["steel"]) else pal["signal"]
+    return pal
+
+
+def apply_colors(cfg):
+    C.update(build_palette(cfg["color_theme"], cfg["color_bar"], cfg["color_accent"]))
+
+
 _BODY, _DIN, _MONO = "Segoe UI Variable Text", "Bahnschrift", "Cascadia Mono"
 F = {
     "brand": ("Bahnschrift SemiBold", 14), "order": ("Bahnschrift SemiBold", 20), "title": (_DIN, 14),
@@ -3766,21 +3844,26 @@ def apply_theme(root):
     s = ttk.Style(root)
     s.theme_use("clam")
     s.configure(".", background=C["hall"], foreground=C["ink"], font=F["body"], bordercolor=C["line_strong"],
-                focuscolor=C["steel"], troughcolor=C["hall"])
+                focuscolor=C["focus"], troughcolor=C["hall"])
     s.configure("TFrame", background=C["hall"])
     s.configure("TLabel", background=C["hall"], foreground=C["ink"])
     s.configure("TLabelframe", background=C["hall"])
-    s.configure("TCheckbutton", background=C["hall"])
-    s.configure("TRadiobutton", background=C["hall"])
+    s.configure("TCheckbutton", background=C["hall"], foreground=C["ink"], indicatorbackground=C["paper"])
+    s.configure("TRadiobutton", background=C["hall"], foreground=C["ink"], indicatorbackground=C["paper"])
+    s.map("TCheckbutton", background=[("active", C["hall"])])
+    s.map("TRadiobutton", background=[("active", C["hall"])])
+    s.configure("TCombobox", fieldbackground=C["paper"], foreground=C["ink"], background=C["paper"],
+                arrowcolor=C["muted"], bordercolor=C["line_strong"], lightcolor=C["paper"], darkcolor=C["paper"])
+    s.map("TCombobox", fieldbackground=[("readonly", C["paper"])], foreground=[("readonly", C["ink"])])
     s.configure("TEntry", fieldbackground=C["paper"], bordercolor=C["line_strong"], lightcolor=C["paper"],
-                padding=4)
-    s.map("TEntry", bordercolor=[("focus", C["steel"])], lightcolor=[("focus", C["steel"])])
+                foreground=C["ink"], insertcolor=C["ink"], padding=4)
+    s.map("TEntry", bordercolor=[("focus", C["focus"])], lightcolor=[("focus", C["focus"])])
     s.configure("TButton", background=C["paper"], foreground=C["ink"], bordercolor=C["line_strong"],
                 lightcolor=C["paper"], darkcolor=C["paper"], padding=(12, 5), font=F["button"])
     s.map("TButton", background=[("active", C["hover"]), ("pressed", C["line"])])
     s.configure("Treeview", background=C["paper"], fieldbackground=C["paper"], foreground=C["ink"],
                 rowheight=30, borderwidth=0, font=F["body"])
-    s.map("Treeview", background=[("selected", C["steel"])], foreground=[("selected", "white")])
+    s.map("Treeview", background=[("selected", C["select"])], foreground=[("selected", C["on_select"])])
     s.configure("Treeview.Heading", background=C["hall"], foreground=C["muted"], font=F["head"],
                 relief="flat", borderwidth=0, padding=(6, 7))
     s.map("Treeview.Heading", background=[("active", C["hover"])])
@@ -3793,11 +3876,19 @@ def apply_theme(root):
                 bordercolor=C["hall"], lightcolor=C["signal"], darkcolor=C["signal"], thickness=6)
     root.option_add("*Toplevel.background", C["hall"])
     root.option_add("*Menu.background", C["paper"])
-    root.option_add("*Menu.activeBackground", C["steel"])
-    root.option_add("*Menu.activeForeground", "white")
+    root.option_add("*Menu.foreground", C["ink"])
+    root.option_add("*Menu.activeBackground", C["select"])
+    root.option_add("*Menu.activeForeground", C["on_select"])
     root.option_add("*Menu.font", F["body"])
     root.option_add("*Menu.relief", "flat")
     root.option_add("*Text.font", F["body"])
+    for w in ("Text", "Entry", "Label", "Listbox"):  # Textfarbe auch im dunklen Schema
+        root.option_add(f"*{w}.foreground", C["ink"])
+    for w in ("Text", "Entry"):
+        root.option_add(f"*{w}.insertBackground", C["ink"])
+    root.option_add("*TCombobox*Listbox.background", C["paper"])
+    root.option_add("*TCombobox*Listbox.selectBackground", C["select"])
+    root.option_add("*TCombobox*Listbox.selectForeground", C["on_select"])
 
 
 def icon_png(kind, px=18):
@@ -3811,7 +3902,7 @@ def icon_png(kind, px=18):
     check = [(4.6 * k, 9.4 * k), (7.6 * k, 12.4 * k), (13.4 * k, 5.9 * k)]
     fill, border, mark, stroke = {
         "box": (C["paper"], C["line_strong"], None, 0),
-        "box_on": (C["signal"], "#C99600", C["ink"], 1.15 * k),
+        "box_on": (C["signal"], C["signal_edge"], C["on_signal"], 1.15 * k),
         "box_off": (C["hall"], C["line"], None, 0),
         "done": (None, None, C["green_ink"], 1.35 * k),
     }[kind]
@@ -3874,7 +3965,7 @@ class RowButton(tk.Label):
     """„Senden“ in einer Tabellenzeile. Signalgelb, damit er auch auf markierten (dunklen) Zeilen sichtbar bleibt."""
 
     def __init__(self, tree, command):
-        super().__init__(tree, text="Senden  ›", bg=C["signal"], fg=C["ink"], font=F["row_button"], cursor="hand2",
+        super().__init__(tree, text="Senden  ›", bg=C["signal"], fg=C["on_signal"], font=F["row_button"], cursor="hand2",
                          bd=0, highlightthickness=1, highlightbackground=C["signal_edge"])
         self.iid = None
         self.bind("<Enter>", lambda e: self.configure(bg=C["signal_hover"]))
@@ -3890,14 +3981,17 @@ class RowButton(tk.Label):
 
 class FlatButton(tk.Label):
     """Flacher Button: 'bar' (auf Graphit), 'primary' (Signalgelb), 'ghost' (auf Hallengrau)."""
-    VARIANTS = {
-        "bar": dict(bg=C["steel"], fg=C["steel_text"], hover=C["steel_hover"], hfg="white", font="button"),
-        "primary": dict(bg=C["signal"], fg=C["ink"], hover=C["signal_hover"], hfg=C["ink"], font="button"),
-        "ghost": dict(bg=C["hall"], fg=C["ink"], hover=C["hover"], hfg=C["ink"], font="body"),
-    }
+    @staticmethod
+    def variants():
+        return {
+            "bar": dict(bg=C["steel"], fg=C["steel_text"], hover=C["steel_hover"], hfg=C["on_steel"], font="button"),
+            "primary": dict(bg=C["signal"], fg=C["on_signal"], hover=C["signal_hover"], hfg=C["on_signal"],
+                            font="button"),
+            "ghost": dict(bg=C["hall"], fg=C["ink"], hover=C["hover"], hfg=C["ink"], font="body"),
+        }
 
     def __init__(self, master, text, command, variant="ghost"):
-        v = self.VARIANTS[variant]
+        v = self.variants()[variant]
         super().__init__(master, text=text, bg=v["bg"], fg=v["fg"], font=F[v["font"]], cursor="hand2",
                          padx=16 if variant == "primary" else 11, pady=6)
         self.v, self.command, self._disabled = v, command, False
@@ -4043,7 +4137,7 @@ class ManualDialog(tk.Toplevel):
         ttk.Label(f, text="Sendungsnummer(n) – eine pro Zeile, leer lassen wenn keine:").grid(
             row=1, column=0, columnspan=2, sticky="w", pady=(10, 2))
         self.tn = tk.Text(f, width=46, height=4, font=F["mono"], relief="flat", highlightthickness=1,
-                          highlightbackground=C["line_strong"], highlightcolor=C["steel"])
+                          highlightbackground=C["line_strong"], highlightcolor=C["focus"])
         self.tn.grid(row=2, column=0, columnspan=2, sticky="we")
         self.tn.focus_set()
         ttk.Label(f, text="Notiz (optional, z. B. „Abholung“, „GLS manuell“):").grid(
@@ -4278,6 +4372,7 @@ class SettingsDialog(tk.Toplevel):
             row=r + 1, column=0, columnspan=2, sticky="w", pady=(8, 0))
         b = ttk.Frame(f)
         b.grid(row=r + 2, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(b, text="Farben…", command=lambda: ColorDialog(self, self.cfg)).pack(side="left", padx=(0, 6))
         ttk.Button(b, text="Protokoll öffnen", command=self.open_log).pack(side="left", padx=(0, 6))
         ttk.Button(b, text="Speed4Trade-Anbindung…", command=lambda: S4TDialog(self, self.cfg)).pack(
             side="left", padx=(0, 16))
@@ -4614,7 +4709,7 @@ class TrackingWindow(tk.Toplevel):
         top = tk.Frame(self, bg=C["hall"], padx=14, pady=10)
         top.pack(fill="x")
         box = tk.Frame(top, bg=C["paper"], highlightthickness=1, highlightbackground=C["line_strong"],
-                       highlightcolor=C["steel"])
+                       highlightcolor=C["focus"])
         box.pack(side="left")
         tk.Label(box, text="⌕", bg=C["paper"], fg=C["muted"], font=(F["body"][0], 13)).pack(side="left", padx=(8, 2))
         self.search = tk.StringVar()
@@ -4823,6 +4918,115 @@ class TrackingWindow(tk.Toplevel):
         m.add_command(label="Bei DHL öffnen", command=self.open_dhl)
         m.add_command(label="Sendungsnummer kopieren", command=self.copy_number)
         m.tk_popup(e.x_root, e.y_root)
+
+
+class ColorDialog(tk.Toplevel):
+    """Farbschema und eigene Farben für diesen Arbeitsplatz, mit Vorschau. Übernommen wird beim Neustart."""
+
+    def __init__(self, master, cfg: Config):
+        super().__init__(master)
+        self.cfg = cfg
+        self.title("Farben")
+        self.resizable(False, False)
+        self.transient(master)
+        f = ttk.Frame(self, padding=14)
+        f.pack(fill="both")
+        ttk.Label(f, text="Farbschema", font=F["section"]).grid(row=0, column=0, columnspan=3, sticky="w")
+        self.theme = tk.StringVar(value=cfg["color_theme"] if cfg["color_theme"] in THEMES else "Standard")
+        for r, name in enumerate(THEMES, 1):
+            pal = build_palette(name)
+            sw = tk.Canvas(f, width=46, height=18, highlightthickness=1, highlightbackground=C["line_strong"],
+                           bg=pal["steel"])
+            sw.create_rectangle(30, 0, 47, 19, fill=pal["signal"], width=0)
+            sw.grid(row=r, column=0, sticky="w", pady=2)
+            ttk.Radiobutton(f, text=name, value=name, variable=self.theme, command=self._preview).grid(
+                row=r, column=1, columnspan=2, sticky="w", padx=(8, 0))
+        r = len(THEMES) + 1
+        ttk.Label(f, text="Eigene Farben (optional)", font=F["section"]).grid(
+            row=r, column=0, columnspan=3, sticky="w", pady=(14, 2))
+        self.custom = {"color_bar": tk.StringVar(value=cfg["color_bar"]),
+                       "color_accent": tk.StringVar(value=cfg["color_accent"])}
+        self.swatches = {}
+        for key, label in (("color_bar", "Leiste oben"), ("color_accent", "Akzent (Knöpfe, Auswahl)")):
+            r += 1
+            sw = tk.Label(f, width=5, relief="flat", highlightthickness=1, highlightbackground=C["line_strong"],
+                          cursor="hand2")
+            sw.grid(row=r, column=0, sticky="w", pady=2)
+            sw.bind("<Button-1>", lambda e, k=key: self._pick(k))
+            self.swatches[key] = sw
+            ttk.Label(f, text=label).grid(row=r, column=1, sticky="w", padx=(8, 12))
+            bf = ttk.Frame(f)
+            bf.grid(row=r, column=2, sticky="w")
+            ttk.Button(bf, text="Wählen…", command=lambda k=key: self._pick(k)).pack(side="left")
+            ttk.Button(bf, text="Aus Schema", command=lambda k=key: self._reset(k)).pack(side="left", padx=(4, 0))
+        r += 1
+        ttk.Label(f, text="Vorschau", font=F["section"]).grid(row=r, column=0, columnspan=3, sticky="w", pady=(14, 4))
+        self.prev = tk.Frame(f, highlightthickness=1, highlightbackground=C["line_strong"])
+        self.prev.grid(row=r + 1, column=0, columnspan=3, sticky="we")
+        ttk.Label(f, text="Gilt nur für diesen Arbeitsplatz. Das Tool startet zum Übernehmen neu.",
+                  foreground=C["muted"]).grid(row=r + 2, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        b = ttk.Frame(f)
+        b.grid(row=r + 3, column=0, columnspan=3, sticky="e", pady=(12, 0))
+        ttk.Button(b, text="Übernehmen", command=self.ok).pack(side="left")
+        ttk.Button(b, text="Abbrechen", command=self.destroy).pack(side="left", padx=(6, 0))
+        self.bind("<Escape>", lambda e: self.destroy())
+        self._preview()
+        center_over(self, master)
+        self.grab_set()
+        self.wait_window()
+
+    def _palette(self):
+        return build_palette(self.theme.get(), self.custom["color_bar"].get(), self.custom["color_accent"].get())
+
+    def _pick(self, key):
+        from tkinter import colorchooser
+        pal = self._palette()
+        rgb, hx = colorchooser.askcolor(color=pal["steel" if key == "color_bar" else "signal"], parent=self,
+                                        title="Leistenfarbe wählen" if key == "color_bar" else "Akzentfarbe wählen")
+        if hx:
+            self.custom[key].set(hx.upper())
+            self._preview()
+
+    def _reset(self, key):
+        self.custom[key].set("")
+        self._preview()
+
+    def _preview(self):
+        pal = self._palette()
+        for key, sw in self.swatches.items():
+            sw.configure(bg=pal["steel" if key == "color_bar" else "signal"])
+        for w in self.prev.winfo_children():
+            w.destroy()
+        bar = tk.Frame(self.prev, bg=pal["steel"], padx=12, pady=8)
+        bar.pack(fill="x")
+        tk.Label(bar, text=APP_NAME, bg=pal["steel"], fg=pal["on_steel"], font=F["brand"]).pack(side="left")
+        tk.Label(bar, text="Aus S4T abholen", bg=pal["steel"], fg=pal["steel_text"], font=F["button"]).pack(
+            side="left", padx=(16, 0))
+        tk.Label(bar, text="Ausgewählte senden", bg=pal["signal"], fg=pal["on_signal"], font=F["button"],
+                 padx=12, pady=4).pack(side="right")
+        body = tk.Frame(self.prev, bg=pal["hall"], padx=12, pady=10)
+        body.pack(fill="x")
+        for text, bg, fg in (("50100   Kunde 0   Aachen", pal["paper"], pal["ink"]),
+                             ("50101   Kunde 1   Aachen   (markiert)", pal["select"], pal["on_select"]),
+                             ("50102   Kunde 2   versendet", pal["green_bg"], pal["green_ink"]),
+                             ("50103   Kunde 3   bitte prüfen", pal["amber_bg"], pal["amber_ink"])):
+            row = tk.Frame(body, bg=bg)
+            row.pack(fill="x")
+            tk.Label(row, text="Senden  ›", bg=pal["signal"], fg=pal["on_signal"], font=F["row_button"],
+                     padx=8).pack(side="left", padx=6, pady=4)
+            tk.Label(row, text=text, bg=bg, fg=fg, font=F["body"]).pack(side="left", padx=6)
+
+    def ok(self):
+        new = {"color_theme": self.theme.get(), **{k: v.get() for k, v in self.custom.items()}}
+        changed = any(self.cfg[k] != v for k, v in new.items())
+        for k, v in new.items():
+            self.cfg[k] = v
+        self.cfg.save()
+        self.destroy()
+        if changed:
+            self._root().restart_pending = True
+            messagebox.showinfo(APP_NAME, "Die neuen Farben erscheinen, sobald du das Einstellungsfenster schließt "
+                                          "– das Tool startet dafür kurz neu.", parent=self.master)
 
 
 def selftest(path):
