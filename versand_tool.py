@@ -80,6 +80,7 @@ DEFAULTS = {
     "s4t_cert_sha256": "",     # Fingerabdruck des bestätigten Server-Zertifikats
     "s4t_tag": "",             # optional: nur Aufträge mit diesem Auftragskennzeichen (leer = alle im Status)
     "s4t_status_id": "130",    # paid shipping
+    "s4t_status_extra": "240",  # weitere Status (z. B. 240 aus dem Shop), nur noch nicht versendete Shop-Aufträge
     "s4t_mandator": "1",
     "s4t_report": "1",         # Versand mit Sendungsnummer an S4T zurückmelden
     # Versandweg: "sendcloud" oder "dhl" (direkt über den eigenen DHL-Geschäftskundenvertrag, nur national)
@@ -99,7 +100,7 @@ DEFAULTS = {
 SHARED_SETTINGS = ("default_weight_kg", "shipping_option_de", "shipping_option_eu", "contract_id", "brand_id",
                    "sender_name", "sender_company", "sender_email", "sender_phone", "sender_street",
                    "sender_house_number", "sender_postal_code", "sender_city", "sender_country", "use_history",
-                   "s4t_host", "s4t_cert_sha256", "s4t_tag", "s4t_status_id", "s4t_mandator", "s4t_report",
+                   "s4t_host", "s4t_cert_sha256", "s4t_tag", "s4t_status_id", "s4t_status_extra", "s4t_mandator", "s4t_report",
                    "carrier", "dhl_sandbox", "dhl_billing", "dhl_profile", "dhl_print_format")
 REQUIRED_SENDER = (("sender_company", "Absender Firma"), ("sender_street", "Absender Straße"),
                    ("sender_house_number", "Absender Hausnr."), ("sender_postal_code", "Absender PLZ"),
@@ -1251,23 +1252,37 @@ class S4T:
         return [(m.findtext("mandator_id"), m.findtext("identifier")) for m in resp.findall("mandator")]
 
     def fetch_orders(self, default_weight):
-        """Aufträge im eingestellten Status (130 = bezahlt, Versand offen), optional nur mit einem Kennzeichen."""
+        """Aufträge im eingestellten Status (130 = bezahlt, Versand offen), optional nur mit einem Kennzeichen.
+        Dazu Shop-Aufträge in den weiteren Status (240), sofern noch nicht versendet."""
+        main, *extra = s4t_statuses(self.cfg)
+        orders, seen = [], set()
+        for status in (main, *extra):
+            for x in self._fetch_status(status):
+                if x.findtext("order_id") in seen:
+                    continue
+                if status != main and not s4t_shop_open(x):
+                    continue
+                seen.add(x.findtext("order_id"))
+                orders.append(s4t_order(x, default_weight))
+        return orders
+
+    def _fetch_status(self, status):
         c = self.cfg
         flt = (f'<mandator_id filter_method="=" filter_value="{int(c["s4t_mandator"] or 1)}"/>'
-               f'<order_status_id filter_method="=" filter_value="{int(c["s4t_status_id"] or 130)}"/>')
+               f'<order_status_id filter_method="=" filter_value="{status}"/>')
         if c["s4t_tag"].strip():  # Filter erwartet den Namen des Kennzeichens, nicht die ID
             flt += (f'<order_tags filter_method="IN"><filter_values><filter_value>{xml_escape(c["s4t_tag"].strip())}'
                     '</filter_value></filter_values></order_tags>')
-        orders, page = [], 1
+        found_all, page = [], 1
         while True:
             resp = self._call("fetchOrders", f'<request method="fetchOrders" version="1.0.0"><filter>{flt}</filter>'
                                              '<use_modification_context_filter>false</use_modification_context_filter>'
                                              f'<orders_per_page>100</orders_per_page><page>{page}</page></request>')
             found = resp.findall("order")
-            orders += [s4t_order(x, default_weight) for x in found]
+            found_all += found
             pages = int(resp.findtext("report/total_number_of_pages") or 1)
             if page >= pages or not found:
-                return orders
+                return found_all
             page += 1
 
     def order(self, order_id):
@@ -1281,9 +1296,9 @@ class S4T:
         """Versand mit Sendungsnummer(n) melden – S4T setzt den Status im passenden Workflow auf versendet.
         Bei Shop-Aufträgen (COMMERCE) übernimmt S4T mit den Paketdaten nur die Sendungsnummer und lässt den Status
         stehen; erst ein zweites SHIPPED ohne Paketdaten setzt ihn. Deshalb wird nachgelesen. Rückgabe: Warnungen."""
-        open_status = str(int(self.cfg["s4t_status_id"] or 130))
+        open_states = {str(x) for x in s4t_statuses(self.cfg)}
         before = self.order(o.s4t_id)
-        if before is not None and before.findtext("order_status/order_status_id") != open_status:
+        if before is not None and before.findtext("order_status/order_status_id") not in open_states:
             return []  # schon weitergesetzt (z. B. von Hand in CONNECT) – erneutes SHIPPED liefert sonst Fehler -9
         # bereits eingetragene Sendungsnummern nicht noch einmal senden, S4T legte sonst weitere Pakete an
         known = {(t.text or "").strip() for t in before.iter("tracking_number")} if before is not None else set()
@@ -1301,15 +1316,33 @@ class S4T:
             return [w.text.strip() for w in resp.iter("warning_message") if (w.text or "").strip()]
         warnings = shipped(infos)
         after = self.order(o.s4t_id)
-        if infos and after is not None and after.findtext("order_status/order_status_id") == open_status:
+        if infos and after is not None and after.findtext("order_status/order_status_id") in open_states:
             warnings += shipped()
             after = self.order(o.s4t_id)
-        if after is not None and after.findtext("order_status/order_status_id") == open_status:
+        if after is not None and after.findtext("order_status/order_status_id") in open_states:
             name = after.findtext("order_status/order_status_identifier") or ""
-            raise S4TError(f"Sendungsnummer ist eingetragen, der Auftrag steht aber weiter auf {open_status} „{name}“ "
+            raise S4TError("Sendungsnummer ist eingetragen, der Auftrag steht aber weiter auf "
+                           f"{after.findtext('order_status/order_status_id')} „{name}“ "
                            "statt versendet. Bitte in CONNECT auf versendet setzen"
                            + (f" (S4T: {'; '.join(warnings)})" if warnings else ""))
         return warnings
+
+
+def s4t_statuses(cfg):
+    """Abzuholende Status: Hauptstatus zuerst, dann die weiteren (Komma-getrennt), ohne Doppelte."""
+    out = [int(cfg["s4t_status_id"] or 130)]
+    for v in re.split(r"[,;\s]+", cfg["s4t_status_extra"]):
+        if v.isdigit() and int(v) not in out:
+            out.append(int(v))
+    return out
+
+
+def s4t_shop_open(x):
+    """Weitere Status (240) enthalten auch alte Marktplatz-Aufträge (Kaufland) – dort nur Aufträge aus dem eigenen
+    Shop (COMMERCE), die noch nicht versendet sind (keine Sendungsnummer, kein Paket)."""
+    if "COMMERCE" not in (x.findtext(".//sub_channel/sub_channel_identifier") or "").upper():
+        return False
+    return not any((e.text or "").strip() for tag in ("tracking_number", "packet_id") for e in x.iter(tag))
 
 
 def s4t_order(x, default_weight):
@@ -4467,7 +4500,8 @@ class SettingsDialog(tk.Toplevel):
 
 class S4TDialog(tk.Toplevel):
     FIELDS = [("s4t_host", "Server (Adresse/IP)"), ("s4t_user", "Webservice-Benutzer"),
-              ("s4t_status_id", "Auftragsstatus-ID"), ("s4t_mandator", "Mandant"),
+              ("s4t_status_id", "Auftragsstatus-ID"), ("s4t_status_extra", "Weitere Status (z. B. 240)"),
+              ("s4t_mandator", "Mandant"),
               ("s4t_tag", "Nur mit Kennzeichen (optional)")]
 
     def __init__(self, master, cfg: Config):
@@ -4478,8 +4512,10 @@ class S4TDialog(tk.Toplevel):
         self.transient(master)
         f = ttk.Frame(self, padding=14)
         f.pack(fill="both")
-        ttk.Label(f, text="Abgeholt werden alle Aufträge im angegebenen Status (130 = bezahlt, Versand offen). "
-                          "Optional lässt sich auf ein Auftragskennzeichen einschränken.", foreground=C["muted"],
+        ttk.Label(f, text="Abgeholt werden alle Aufträge im angegebenen Status (130 = bezahlt, Versand offen), "
+                          "dazu Shop-Aufträge in den weiteren Status (Komma-getrennt, z. B. 240), solange sie "
+                          "noch nicht versendet sind. Optional lässt sich auf ein Auftragskennzeichen "
+                          "einschränken.", foreground=C["muted"],
                   wraplength=460).grid(
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
         self.vars = {}
@@ -4571,6 +4607,10 @@ class S4TDialog(tk.Toplevel):
             if not self.vars[k].get().strip().isdigit():
                 messagebox.showerror(APP_NAME, "Status-ID und Mandant müssen Zahlen sein.", parent=self)
                 return
+        if not all(v.isdigit() for v in re.split(r"[,;\s]+", self.vars["s4t_status_extra"].get().strip()) if v):
+            messagebox.showerror(APP_NAME, "Weitere Status: nur Zahlen, durch Komma getrennt (z. B. 240).",
+                                 parent=self)
+            return
         if self.vars["s4t_host"].get().strip() and not self.pin and not self._confirm_cert():
             return
         self._apply(self.cfg)
