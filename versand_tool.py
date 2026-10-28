@@ -1,5 +1,5 @@
 """
-BOB Sendcloud-Versand
+S4T Versandzentrale
 Liest den S4T-Versandexport ("GLS_*.csv", versendet wird mit DHL), korrigiert bekannte
 Exportfehler, zeigt die Aufträge an, legt ausgewählte Sendungen bei Sendcloud an und
 exportiert die Sendungsnummern.
@@ -29,7 +29,7 @@ from xml.sax.saxutils import escape as xml_escape
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-APP_NAME = "BOB Sendcloud-Versand"
+APP_NAME = "S4T Versandzentrale"
 APP_VERSION = "1.0.0"  # wird beim Release-Build aus dem Git-Tag (v1.2.3) gesetzt
 # GitHub-Repository für die Updateprüfung, Format "besitzer/repo". Leer = keine Updateprüfung.
 UPDATE_REPO = "N1mmermehr80/bob-versandtool"
@@ -89,6 +89,7 @@ DEFAULTS = {
     "dhl_billing": "",         # 14-stellige Abrechnungsnummer DHL Paket (EKP + 01 + Teilnahme)
     "dhl_profile": "STANDARD_GRUPPENPROFIL",
     "dhl_print_format": "910-300-400",  # 100 × 150 mm, Thermodruck (Zebra), randlos
+    "dhl_track_user": "",      # GKP-Benutzer mit Recht „Sendungsverfolgung“ (leer = dhl_user), Passwort verschlüsselt
 }
 
 # Diese Einstellungen gelten für alle Arbeitsplätze (im gemeinsamen Ordner); Zugangsdaten bleiben pro PC.
@@ -209,6 +210,14 @@ class Config:
     @property
     def dhl_api_secret(self):
         return unprotect(self.cp["settings"].get("dhl_api_secret_enc", ""))
+
+    @property
+    def dhl_track_password(self):
+        return unprotect(self.cp["settings"].get("dhl_track_password_enc", ""))
+
+    @dhl_track_password.setter
+    def dhl_track_password(self, pw):
+        self.cp["settings"]["dhl_track_password_enc"] = protect(pw)
 
     def set_dhl(self, api_key, api_secret, password):
         self.cp["settings"]["dhl_api_key_enc"] = protect(api_key.strip())
@@ -955,6 +964,205 @@ def carrier(cfg: Config):
 def label_client(cfg: Config, parcel_id):
     """Zum Nachladen eines Labels: Herkunft steht an der ID, unabhängig vom eingestellten Versandweg."""
     return DHL(cfg) if str(parcel_id).startswith(DHL_PREFIX) else Sendcloud(cfg)
+
+
+# --------------------------------------------------------------------------- DHL-Sendungsverfolgung
+
+DHL_TRACK_SANDBOX_LOGIN = ("zt12345", "geheim")  # öffentliche Testdaten von DHL
+DHL_TRACK_PAGE = "https://www.dhl.de/de/privatkunden/pakete-empfangen/verfolgen.html?piececode={}"
+TRACK_FILE = "sendungsverfolgung.json"
+TRACK_RECHECK_MIN = 30   # nicht zugestellte Sendungen frühestens nach so vielen Minuten erneut abfragen
+TRACK_STALL_DAYS = 3     # so lange ohne neues Ereignis -> „hängt“
+TRACK_PROBLEM_RX = re.compile(r"rücksend|zurückgesandt|zurück an den absender|retour|nicht zustellbar|unzustellbar|"
+                              r"adresse (nicht|unvollständig|fehlerhaft|unbekannt)|adressfehler|empfänger unbekannt|"
+                              r"verzogen|beschädig|verweigert|nicht angenommen|nicht abgeholt|verlust", re.I)
+TRACK_PICKUP_RX = re.compile(r"zur abholung|abholbereit|abholung bereit|in die packstation|benachrichtigt|"
+                             r"nicht angetroffen", re.I)
+
+
+class DHLTracking:
+    """Sendungsverfolgung für Geschäftskunden (DHL Parcel DE Tracking, d-get-piece-detail): XML im GET-Parameter,
+    bis 15 Sendungsnummern je Abfrage, höchstens 1000 Abfragen am Tag und 3 je Sekunde. Zugestellte Sendungen
+    sollen laut DHL nicht erneut abgefragt werden. Eine Liste aller Sendungen bietet DHL nicht an – die Nummern
+    kommen aus dem Versandprotokoll (tracking_archive)."""
+    BATCH = 15
+
+    def __init__(self, cfg: Config):
+        self.sandbox = cfg["dhl_sandbox"] == "1"
+        self.url = DHL_API[self.sandbox] + "/parcel/de/tracking/v0/shipments"
+        self.key, self.secret = cfg.dhl_api_key, cfg.dhl_api_secret
+        self.user, self.password = DHL_TRACK_SANDBOX_LOGIN if self.sandbox else \
+            (cfg["dhl_track_user"].strip() or cfg["dhl_user"].strip(), cfg.dhl_track_password or cfg.dhl_password)
+        self._basic = False  # Basic Auth mit API-Key/Secret nur, falls das Gateway sie verlangt
+
+    @property
+    def missing(self):
+        return [n for v, n in ((self.key, "DHL API-Key"), (self.user, "Benutzer für die Sendungsverfolgung"),
+                               (self.password, "Passwort für die Sendungsverfolgung")) if not v]
+
+    def query(self, numbers):
+        """{Sendungsnummer: Ergebnis} für bis zu 15 Nummern. Nummern ohne Daten bei DHL: Ergebnis mit 'error'."""
+        attrs = {"appname": self.user, "password": self.password, "request": "d-get-piece-detail",
+                 "language-code": "de", "piece-code": ";".join(numbers)}
+        quote = {'"': "&quot;"}
+        xml = ('<?xml version="1.0" encoding="UTF-8" standalone="no"?><data '
+               + " ".join(f'{k}="{xml_escape(v, quote)}"' for k, v in attrs.items()) + "/>")
+        url = self.url + "?xml=" + urllib.parse.quote(xml)
+        for attempt in range(4):
+            headers = {"DHL-API-Key": self.key, "Accept": "application/xml",
+                       "User-Agent": f"BOB-Sendcloud-Versand/{APP_VERSION}"}
+            if self._basic:
+                headers["Authorization"] = "Basic " + base64.b64encode(f"{self.key}:{self.secret}".encode()).decode()
+            try:
+                with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as r:
+                    return self._parse(r.read(), numbers)
+            except urllib.error.HTTPError as e:
+                if e.code == 401 and not self._basic and self.secret:
+                    self._basic = True
+                    continue
+                if e.code == 429 and attempt < 3:
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                if e.code in (401, 403):
+                    raise DHLError(f"DHL hat die Abfrage abgelehnt (HTTP {e.code}) – ist die App im DHL Developer "
+                                   "Portal für „DHL Parcel DE Tracking“ freigeschaltet?")
+                raise DHLError(f"HTTP {e.code} bei der Sendungsverfolgung: {e.read().decode(errors='replace')[:300]}")
+            except urllib.error.URLError as e:
+                raise DHLError(f"DHL nicht erreichbar: {e.reason}")
+        raise DHLError("DHL antwortet nicht (zu viele Anfragen) – bitte später erneut versuchen.")
+
+    @staticmethod
+    def _parse(raw, numbers):
+        root = ET.fromstring(raw)
+        code = root.get("code", "0")
+        if code in ("5", "6"):
+            raise DHLError("Anmeldung bei der Sendungsverfolgung fehlgeschlagen – Benutzer und Passwort prüfen "
+                           "(der Benutzer braucht im Geschäftskundenportal das Recht „Sendungsverfolgung“)."
+                           + (" Zu viele Fehlversuche, Zugang vorübergehend gesperrt." if code == "6" else ""))
+        result = {n: {"error": root.get("error") or "Keine Daten bei DHL"} for n in numbers}
+        for s in root.iter("data"):
+            if s.get("name") not in ("pieceshipment", "piece-shipment"):
+                continue
+            num = s.get("piece-code") or s.get("searched-piece-code") or ""
+            if s.get("error-status", "0") not in ("0", ""):
+                result[num] = {"error": s.get("error") or "Keine Daten bei DHL"}
+                continue
+            events = [{"time": e.get("event-timestamp", ""), "text": e.get("event-text") or e.get("event-status", ""),
+                       "place": ", ".join(x for x in (e.get("event-location", ""), e.get("event-country", "")) if x),
+                       "code": e.get("standard-event-code", "")}
+                      for e in s.iter("data") if e.get("name") in ("pieceevent", "piece-event")]
+            result[num] = {"status": s.get("status") or s.get("short-status", ""),
+                           "short": s.get("short-status") or s.get("status", ""),
+                           "time": s.get("status-timestamp") or s.get("last-event-timestamp")
+                           or (events[-1]["time"] if events else ""),
+                           "delivered": s.get("delivery-event-flag") == "1",
+                           "return": s.get("ruecksendung") == "true",
+                           "recipient": s.get("recipient-name") or s.get("pan-recipient-name", ""),
+                           "city": s.get("recipient-city") or s.get("pan-recipient-city", ""),
+                           "events": events}
+        return result
+
+
+def _dhl_time(s):
+    for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return dt.datetime.strptime(s.strip()[:19], fmt)
+        except ValueError:
+            pass
+    return None
+
+
+def tracking_archive(days):
+    """Alle Sendungsnummern aus dem Versandprotokoll (gemeinsamer Ordner und lokal) der letzten `days` Tage:
+    {Sendungsnummer: {"sent", "ref", "name", "via"}} – mehrere Zeilen je Nummer werden zusammengefasst."""
+    paths = [LOG_PATH]
+    if BACKEND is not None:
+        try:
+            with os.scandir(BACKEND.dirs["protokoll"]) as it:
+                paths += [e.path for e in it if e.name.endswith(".csv")]
+        except OSError:
+            pass
+    since = dt.datetime.now() - dt.timedelta(days=days)
+    out = {}
+    for p in paths:
+        try:
+            with open(p, encoding="utf-8-sig", newline="") as f:
+                rows = list(csv.reader(f, delimiter=";"))[1:]
+        except OSError:
+            continue
+        for row in rows:
+            if len(row) < 5 or not row[2].strip():
+                continue
+            try:
+                sent = dt.datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+            if sent < since:
+                continue
+            via = "DHL direkt" if row[3].startswith(DHL_PREFIX) else "Sendcloud" if row[3].strip() else "manuell"
+            for num in re.split(r"[,;\s]+", row[2]):
+                if not num:
+                    continue
+                cur = out.get(num)
+                if cur is None or sent < cur["sent"]:
+                    out[num] = {"sent": sent, "ref": row[1], "name": row[4] or (cur or {}).get("name", ""),
+                                "via": via if via != "manuell" or cur is None else cur["via"]}
+    return out
+
+
+def tracking_state(info, sent):
+    """Einordnung für Liste und Farben: (Kategorie, Text). Kategorien: zugestellt, problem, achtung, unterwegs."""
+    now = dt.datetime.now()
+    if not info:
+        return "unterwegs", "noch nicht abgefragt"
+    if info.get("error"):
+        if (now - sent).days >= 2:
+            return "achtung", "Keine Daten bei DHL"
+        return "unterwegs", "Noch nicht bei DHL erfasst"
+    if info.get("delivered"):
+        return "zugestellt", info.get("short") or "Zugestellt"
+    texts = " ".join([info.get("status", ""), info.get("short", "")] + [e["text"] for e in info["events"][-3:]])
+    if info.get("return") or TRACK_PROBLEM_RX.search(texts):
+        return "problem", info.get("short") or info.get("status") or "Problem"
+    if TRACK_PICKUP_RX.search(info.get("status", "") + " " + info.get("short", "")):
+        return "achtung", info.get("short") or info.get("status")
+    last = _dhl_time(info.get("time", "")) or sent
+    if (now - last).days >= TRACK_STALL_DAYS:
+        return "achtung", f"Seit {(now - last).days} Tagen keine Bewegung"
+    return "unterwegs", info.get("short") or info.get("status") or "unterwegs"
+
+
+class TrackingStore:
+    """Letzte DHL-Antworten je Sendungsnummer, im gemeinsamen Ordner für alle Plätze (spart Abfragen)."""
+
+    def __init__(self):
+        self.path = os.path.join(BACKEND.root if BACKEND is not None else APP_DIR, TRACK_FILE)
+
+    def load(self):
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+
+    def save(self, updates):
+        """Neue Ergebnisse einmischen – ein anderer Platz kann inzwischen eigene geschrieben haben."""
+        data = self.load()
+        for num, rec in updates.items():
+            if rec.get("checked", "") >= data.get(num, {}).get("checked", ""):
+                data[num] = rec
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        tmp = f"{self.path}.{re.sub(r'[^\w.-]', '_', USER)}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        for attempt in range(20):
+            try:
+                os.replace(tmp, self.path)
+                return data
+            except PermissionError:
+                time.sleep(0.1)
+        os.remove(tmp)
+        return data
 
 
 # --------------------------------------------------------------------------- Speed4Trade CONNECT
@@ -1782,7 +1990,7 @@ def append_log(o: Order, note):
 
 # --------------------------------------------------------------------------- Oberfläche
 
-COLS = [("send", "", 84), ("ref", "Auftrag", 70), ("name", "Name", 170), ("company", "Firma", 120),
+COLS = [("send", "", 96), ("ref", "Auftrag", 70), ("name", "Name", 170), ("company", "Firma", 120),
         ("street", "Straße", 150), ("house", "Nr.", 50), ("zip", "PLZ", 60), ("city", "Ort", 120),
         ("country", "Land", 45), ("items", "Artikel", 200), ("value", "Wert €", 75),
         ("weight", "Gewicht kg", 80), ("status", "Status", 120), ("label", "Label", 95),
@@ -1833,7 +2041,7 @@ class App(tk.Tk):
         # ── Kopfleiste (Graphit) mit Aktionen
         bar = tk.Frame(self, bg=C["steel"], padx=14, pady=10)
         bar.pack(fill="x")
-        tk.Label(bar, text="BOB Versand", bg=C["steel"], fg="white", font=F["brand"]).pack(side="left", padx=(0, 22))
+        tk.Label(bar, text=APP_NAME, bg=C["steel"], fg="white", font=F["brand"]).pack(side="left", padx=(0, 22))
         self.btn_s4t = FlatButton(bar, "Aus S4T abholen", self.fetch_s4t, "bar")
         self.btn_s4t.pack(side="left")
         self.btn_open = FlatButton(bar, "CSV importieren…", self.open_file, "bar")
@@ -1864,6 +2072,7 @@ class App(tk.Tk):
         self.btn_export.pack(side="right", padx=(2, 0))
         self.btn_print = FlatButton(bar, "Labels drucken…", self.print_labels, "bar")
         self.btn_print.pack(side="right")
+        FlatButton(bar, "Sendungsverfolgung", self.tracking, "bar").pack(side="right", padx=(0, 2))
 
         # ── Update-Hinweis (nur sichtbar, wenn eine neue Version bereitsteht)
         self.update_bar = tk.Frame(self, bg=C["signal"], padx=14, pady=7)
@@ -1946,7 +2155,11 @@ class App(tk.Tk):
                              "e" if key in ("value", "weight") else "w")
         ys = ttk.Scrollbar(frm, orient="vertical", command=self.tree.yview)
         xs = ttk.Scrollbar(frm, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+        # Senden-Knöpfe sind echte Widgets über Spalte 1 (Treeview-Zellen können nur Text) – ihre Lage wird
+        # nach Scrollen, Größenänderung, Spaltenziehen und Neuaufbau nachgeführt
+        self._send_btns, self._send_job = [], None
+        self.tree.configure(yscrollcommand=lambda *a: (ys.set(*a), self._place_send_buttons_later()),
+                            xscrollcommand=lambda *a: (xs.set(*a), self._place_send_buttons_later()))
         self.tree.grid(row=0, column=0, sticky="nsew")
         ys.grid(row=0, column=1, sticky="ns")
         xs.grid(row=1, column=0, sticky="ew")
@@ -1964,6 +2177,8 @@ class App(tk.Tk):
         self.tree.bind("<Double-1>", lambda e: self.edit_current() if self.tree.identify_region(e.x, e.y) == "cell"
                        and self.tree.identify_column(e.x) not in ("#0", "#1") else None)
         self.tree.bind("<Motion>", self._hover)
+        for ev in ("<Configure>", "<B1-Motion>", "<ButtonRelease-1>"):
+            self.tree.bind(ev, lambda e: self._place_send_buttons_later(), add="+")
         self.tree.bind("<space>", lambda e: self._toggle(self.tree.focus()))
         self.tree.bind("<<TreeviewSelect>>", lambda e: self._show_details())
 
@@ -2043,7 +2258,7 @@ class App(tk.Tk):
         return self.icons["box_on" if o.selected else "box"]
 
     def _row_values(self, o):
-        return ("▶  Senden" if self._can_send(o) else "", o.ref, o.name, o.company, o.street, o.house, o.zip, o.city,
+        return ("", o.ref, o.name, o.company, o.street, o.house, o.zip, o.city,
                 o.country, o.items_text, f"{o.value:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."),
                 o.weight_text, o.status + (f" ({o.locked_by})" if o.busy_elsewhere else ""), self._label_text(o),
                 o.tracking)
@@ -2113,6 +2328,7 @@ class App(tk.Tk):
             self.tree.focus(keep)
             self.tree.selection_set(keep)
             self.tree.see(keep)
+        self._place_send_buttons_later()
         filtered = shown != len(self.orders)
         self.count_label.configure(text=f"{shown} von {len(self.orders)} angezeigt" if filtered else "")
         current = self.filter.get()
@@ -2182,6 +2398,7 @@ class App(tk.Tk):
             o = self.orders[i]
             self.tree.item(str(i), image=self._box_icon(o), values=self._row_values(o), tags=(self._tag(o),))
             self._update_head_box()
+            self._place_send_buttons_later()
 
     def _update_status(self, extra=""):
         if not self.orders:
@@ -2199,10 +2416,32 @@ class App(tk.Tk):
             self._toggle(iid)
             return "break"
         if region == "cell" and col == "#1" and iid and self._can_send(self.orders[int(iid)]):
-            self.tree.focus(iid)
-            self.tree.selection_set(iid)
-            self.send_one(self.orders[int(iid)])
+            self._send_row(iid)
             return "break"
+
+    def _send_row(self, iid):
+        self.tree.focus(iid)
+        self.tree.selection_set(iid)
+        self.send_one(self.orders[int(iid)])
+
+    def _place_send_buttons_later(self):
+        if not self._send_job:
+            self._send_job = self.after_idle(self._place_send_buttons)
+
+    def _place_send_buttons(self):
+        self._send_job = None
+        spots = []
+        for iid in self.tree.get_children():
+            box = self.tree.bbox(iid, "send")
+            if box and box[2] > 40 and self._can_send(self.orders[int(iid)]):
+                spots.append((iid, box))
+        while len(self._send_btns) < len(spots):
+            self._send_btns.append(RowButton(self.tree, self._send_row))
+        for b, (iid, (x, y, w, h)) in zip(self._send_btns, spots):
+            b.iid = iid
+            b.place(x=x + 7, y=y + 4, width=w - 14, height=h - 8)
+        for b in self._send_btns[len(spots):]:
+            b.place_forget()
 
     def _hover(self, e):
         col, iid = self.tree.identify_column(e.x), self.tree.identify_row(e.y)
@@ -2675,6 +2914,16 @@ class App(tk.Tk):
             messagebox.showinfo(APP_NAME, "Keine Aufträge ausgewählt (Häkchen in der ersten Spalte).")
             return
         self._send(sel)
+
+    def tracking(self):
+        """Fenster mit allen Sendungen aus dem Protokoll und ihrem DHL-Status; nur einmal offen."""
+        win = getattr(self, "_track_win", None)
+        if win is not None and win.winfo_exists():
+            win.deiconify()
+            win.lift()
+            win.focus_set()
+            return
+        self._track_win = TrackingWindow(self, self.cfg)
 
     def send_one(self, o):
         """„Senden“ direkt am Auftrag (Spalte in der Liste oder Knopf im Detailbereich)."""
@@ -3490,7 +3739,7 @@ C = {
     "steel": "#22303C", "steel_hover": "#2F404F", "steel_line": "#3A4B5B", "steel_text": "#D5DEE6",
     "hall": "#EEF1F4", "paper": "#FFFFFF", "ink": "#18212B", "muted": "#637282", "faint": "#94A1AE",
     "line": "#DCE2E8", "line_strong": "#C3CCD5", "hover": "#E2E7EC",
-    "signal": "#F5B700", "signal_hover": "#FFC61F",
+    "signal": "#F5B700", "signal_hover": "#FFC61F", "signal_edge": "#D99F00",
     "amber_bg": "#FFF1CC", "amber_ink": "#8A5300",
     "red_bg": "#FDE7E5", "red_ink": "#A3261B",
     "green_bg": "#E3F2E8", "green_ink": "#22663F",
@@ -3504,6 +3753,7 @@ F = {
     "body": (_BODY, 10), "body_l": (_BODY, 11), "body_b": ("Segoe UI Variable Text Semibold", 10),
     "small": (_BODY, 9), "badge": ("Bahnschrift SemiBold", 10), "button": ("Segoe UI Variable Text Semibold", 10),
     "mono": (_MONO, 10), "head": ("Segoe UI Variable Text Semibold", 9),
+    "row_button": ("Segoe UI Variable Text Semibold", 9),
 }
 
 
@@ -3607,6 +3857,37 @@ def icon_png(kind, px=18):
     return base64.b64encode(png)
 
 
+def center_over(win, master, size=None):
+    """Dialog mittig über dem Fenster öffnen, aus dem er kommt – sonst setzt Windows ihn auf den Hauptbildschirm.
+    size: (Breite, Höhe) für Fenster mit fester Größe, sonst die benötigte Größe."""
+    win.withdraw()
+    win.update_idletasks()
+    top = master.winfo_toplevel()
+    w, h = size or (win.winfo_reqwidth(), win.winfo_reqheight())
+    x = top.winfo_rootx() + (top.winfo_width() - w) // 2
+    y = top.winfo_rooty() + max(0, (top.winfo_height() - h) // 3)
+    win.geometry(f"{w}x{h}+{x}+{y}" if size else f"+{x}+{y}")
+    win.deiconify()
+
+
+class RowButton(tk.Label):
+    """„Senden“ in einer Tabellenzeile. Signalgelb, damit er auch auf markierten (dunklen) Zeilen sichtbar bleibt."""
+
+    def __init__(self, tree, command):
+        super().__init__(tree, text="Senden  ›", bg=C["signal"], fg=C["ink"], font=F["row_button"], cursor="hand2",
+                         bd=0, highlightthickness=1, highlightbackground=C["signal_edge"])
+        self.iid = None
+        self.bind("<Enter>", lambda e: self.configure(bg=C["signal_hover"]))
+        self.bind("<Leave>", lambda e: self.configure(bg=C["signal"]))
+        self.bind("<Button-1>", lambda e: self.iid and command(self.iid))
+        # Mausrad und Rechtsklick an die Tabelle weiterreichen, als läge der Knopf nicht darüber
+        self.bind("<MouseWheel>", lambda e: tree.event_generate("<MouseWheel>", delta=e.delta,
+                                                                x=e.x + self.winfo_x(), y=e.y + self.winfo_y()))
+        self.bind("<Button-3>", lambda e: tree.event_generate("<Button-3>", x=e.x + self.winfo_x(),
+                                                              y=e.y + self.winfo_y(), rootx=e.x_root,
+                                                              rooty=e.y_root))
+
+
 class FlatButton(tk.Label):
     """Flacher Button: 'bar' (auf Graphit), 'primary' (Signalgelb), 'ghost' (auf Hallengrau)."""
     VARIANTS = {
@@ -3633,15 +3914,15 @@ class FlatButton(tk.Label):
 class FilterTabs(tk.Frame):
     """Reiter mit Live-Zähler; der aktive trägt eine Signalgelb-Unterstreichung."""
 
-    def __init__(self, master, var, on_change):
+    def __init__(self, master, var, on_change, filters=FILTERS, labels=FILTER_TABS):
         super().__init__(master, bg=C["hall"])
         self.var, self.on_change, self.tabs = var, on_change, {}
-        for f in FILTERS:
+        for f in filters:
             cell = tk.Frame(self, bg=C["hall"], cursor="hand2")
             cell.pack(side="left", padx=(0, 4))
             row = tk.Frame(cell, bg=C["hall"])
             row.pack(padx=8, pady=(4, 2))
-            name = tk.Label(row, text=FILTER_TABS[f], bg=C["hall"], font=F["tab"])
+            name = tk.Label(row, text=labels[f], bg=C["hall"], font=F["tab"])
             name.pack(side="left")
             cnt = tk.Label(row, text="", bg=C["hall"], font=F["tab_count"])
             cnt.pack(side="left", padx=(5, 0))
@@ -3678,7 +3959,7 @@ class FilterTabs(tk.Frame):
         for f, n in counts.items():
             self.tabs[f][3].configure(text=str(n))
             # leere Problem-Reiter abdunkeln, damit die gefüllten auffallen
-            if f in ("Bitte prüfen", "Nicht sendbar / Fehler") and f != self.var.get():
+            if f in ("Bitte prüfen", "Nicht sendbar / Fehler", "Probleme") and f != self.var.get():
                 self.tabs[f][2].configure(fg=C["amber_ink"] if n and f == "Bitte prüfen" else
                                           C["red_ink"] if n else C["faint"])
 
@@ -3774,6 +4055,7 @@ class ManualDialog(tk.Toplevel):
         ttk.Button(b, text="Als versendet markieren", command=self.ok).pack(side="left")
         ttk.Button(b, text="Abbrechen", command=self.destroy).pack(side="left", padx=(6, 0))
         self.bind("<Escape>", lambda e: self.destroy())
+        center_over(self, master)
         self.grab_set()
         self.wait_window()
 
@@ -3833,6 +4115,7 @@ class PrintDialog(tk.Toplevel):
         ttk.Button(b, text="Als PDF öffnen", command=lambda: self.ok("pdf")).pack(side="left", padx=(6, 0))
         ttk.Button(b, text="Abbrechen", command=self.destroy).pack(side="left", padx=(6, 0))
         self.bind("<Escape>", lambda e: self.destroy())
+        center_over(self, master)
         self.grab_set()
         self.wait_window()
 
@@ -3876,6 +4159,7 @@ class EditDialog(tk.Toplevel):
         ttk.Button(b, text="Abbrechen", command=self.destroy).pack(side="left", padx=(6, 0))
         self.bind("<Return>", lambda e: self.ok())
         self.bind("<Escape>", lambda e: self.destroy())
+        center_over(self, master)
         self.grab_set()
         self.wait_window()
 
@@ -3999,6 +4283,7 @@ class SettingsDialog(tk.Toplevel):
             side="left", padx=(0, 16))
         ttk.Button(b, text="Speichern", command=self.ok).pack(side="left")
         ttk.Button(b, text="Abbrechen", command=self.destroy).pack(side="left", padx=(6, 0))
+        center_over(self, master)
         self.grab_set()
         self.wait_window()
 
@@ -4128,6 +4413,7 @@ class S4TDialog(tk.Toplevel):
         ttk.Button(b, text="Speichern", command=self.ok).pack(side="left")
         ttk.Button(b, text="Abbrechen", command=self.destroy).pack(side="left", padx=(6, 0))
         self.bind("<Escape>", lambda e: self.destroy())
+        center_over(self, master)
         self.grab_set()
         self.wait_window()
 
@@ -4230,7 +4516,17 @@ class DHLDialog(tk.Toplevel):
             ttk.Label(f, text=label).grid(row=r, column=0, sticky="w", pady=2)
             ttk.Entry(f, textvariable=var, width=40, show=show).grid(row=r, column=1, sticky="w", padx=(8, 0))
         r = len(rows) + 1
-        ttk.Label(f, text="Labelformat").grid(row=r, column=0, sticky="w", pady=2)
+        ttk.Label(f, text="Sendungsverfolgung – leer lassen, wenn der GKP-Benutzer oben das Recht "
+                          "„Sendungsverfolgung“ hat:", foreground=C["muted"], wraplength=470).grid(
+            row=r, column=0, columnspan=2, sticky="w", pady=(10, 2))
+        self.track_user = tk.StringVar(value=cfg["dhl_track_user"])
+        self.track_pw = tk.StringVar(value=cfg.dhl_track_password)
+        for label, var, show in (("Benutzer Verfolgung", self.track_user, ""), ("Passwort Verfolgung", self.track_pw, "•")):
+            r += 1
+            ttk.Label(f, text=label).grid(row=r, column=0, sticky="w", pady=2)
+            ttk.Entry(f, textvariable=var, width=40, show=show).grid(row=r, column=1, sticky="w", padx=(8, 0))
+        r += 1
+        ttk.Label(f, text="Labelformat").grid(row=r, column=0, sticky="w", pady=(10, 2))
         self.fmt = tk.StringVar(value=cfg["dhl_print_format"] or "910-300-400")
         ttk.Combobox(f, textvariable=self.fmt, values=self.PRINT_FORMATS, width=14, state="readonly").grid(
             row=r, column=1, sticky="w", padx=(8, 0))
@@ -4246,6 +4542,7 @@ class DHLDialog(tk.Toplevel):
         ttk.Button(b, text="Speichern", command=self.ok).pack(side="left")
         ttk.Button(b, text="Abbrechen", command=self.destroy).pack(side="left", padx=(6, 0))
         self.bind("<Escape>", lambda e: self.destroy())
+        center_over(self, master)
         self.grab_set()
         self.wait_window()
 
@@ -4255,6 +4552,8 @@ class DHLDialog(tk.Toplevel):
         cfg.set_dhl(self.key.get(), self.secret.get(), self.pw.get())
         cfg["dhl_print_format"] = self.fmt.get()
         cfg["dhl_sandbox"] = "1" if self.sandbox.get() else "0"
+        cfg["dhl_track_user"] = self.track_user.get().strip()
+        cfg.dhl_track_password = self.track_pw.get()
 
     def test(self):
         tmp = Config.__new__(Config)  # Kopie: Test ohne die gespeicherten Einstellungen zu ändern
@@ -4292,6 +4591,238 @@ class DHLDialog(tk.Toplevel):
                 messagebox.showwarning(APP_NAME, f"Lokal gespeichert, aber nicht im gemeinsamen Ordner:\n{e}",
                                        parent=self)
         self.destroy()
+
+
+TRACK_FILTERS = ["Alle", "Probleme", "Unterwegs", "Zugestellt"]
+TRACK_TABS = {f: f for f in TRACK_FILTERS}
+TRACK_COLS = [("sent", "Versendet", 120), ("ref", "Auftrag", 70), ("name", "Empfänger", 190),
+              ("tracking", "Sendungsnummer", 170), ("state", "Status", 330), ("last", "Letztes Ereignis", 120),
+              ("via", "Über", 85)]
+
+
+class TrackingWindow(tk.Toplevel):
+    """Sendungsverfolgung aller Sendungen aus dem Versandprotokoll mit Status und Verlauf von DHL.
+    Nicht modal: das Hauptfenster bleibt bedienbar."""
+
+    def __init__(self, master, cfg: Config):
+        super().__init__(master)
+        self.cfg, self.q = cfg, queue.Queue()
+        self.archive, self.info, self.rows, self.running = {}, {}, [], False
+        self.title(f"Sendungsverfolgung – {APP_NAME}")
+        self.minsize(900, 500)
+
+        top = tk.Frame(self, bg=C["hall"], padx=14, pady=10)
+        top.pack(fill="x")
+        box = tk.Frame(top, bg=C["paper"], highlightthickness=1, highlightbackground=C["line_strong"],
+                       highlightcolor=C["steel"])
+        box.pack(side="left")
+        tk.Label(box, text="⌕", bg=C["paper"], fg=C["muted"], font=(F["body"][0], 13)).pack(side="left", padx=(8, 2))
+        self.search = tk.StringVar()
+        e = tk.Entry(box, textvariable=self.search, width=30, relief="flat", bd=0, bg=C["paper"], font=F["body_l"])
+        e.pack(side="left", ipady=5, padx=(0, 8))
+        e.bind("<Escape>", lambda ev: self.search.set(""))
+        self.search.trace_add("write", lambda *a: self._fill())
+        tk.Label(top, text="Zeitraum", bg=C["hall"], fg=C["muted"], font=F["body"]).pack(side="left", padx=(18, 6))
+        self.days = tk.StringVar(value="30 Tage")
+        cb = ttk.Combobox(top, textvariable=self.days, values=("14 Tage", "30 Tage", "60 Tage", "90 Tage"),
+                          width=9, state="readonly")
+        cb.pack(side="left")
+        cb.bind("<<ComboboxSelected>>", lambda ev: self.reload())
+        self.btn_refresh = FlatButton(top, "Bei DHL aktualisieren", lambda: self.reload(force=True), "primary")
+        self.btn_refresh.pack(side="right")
+        self.info_label = tk.Label(top, text="", bg=C["hall"], fg=C["muted"], font=F["small"])
+        self.info_label.pack(side="right", padx=(0, 12))
+
+        self.filter = tk.StringVar(value="Alle")
+        self.tabs = FilterTabs(self, self.filter, self._fill, TRACK_FILTERS, TRACK_TABS)
+        self.tabs.pack(fill="x", padx=14)
+
+        frm = tk.Frame(self, bg=C["line"], padx=1, pady=1)
+        frm.pack(fill="both", expand=True, padx=14, pady=(6, 0))
+        self.tree = ttk.Treeview(frm, columns=[c[0] for c in TRACK_COLS], show="headings", selectmode="browse")
+        for key, title, w in TRACK_COLS:
+            self.tree.heading(key, text=title, anchor="w")
+            self.tree.column(key, width=w, minwidth=40, stretch=key in ("name", "state"), anchor="w")
+        ys = ttk.Scrollbar(frm, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=ys.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        ys.grid(row=0, column=1, sticky="ns")
+        frm.rowconfigure(0, weight=1)
+        frm.columnconfigure(0, weight=1)
+        self.tree.tag_configure("problem", background=C["red_bg"], foreground=C["red_ink"])
+        self.tree.tag_configure("achtung", background=C["amber_bg"], foreground=C["amber_ink"])
+        self.tree.tag_configure("zugestellt", foreground=C["green_ink"])
+        self.tree.bind("<<TreeviewSelect>>", lambda ev: self._show_events())
+        self.tree.bind("<Double-1>", lambda ev: self.open_dhl())
+        self.tree.bind("<Button-3>", self._context_menu)
+
+        det = tk.Frame(self, bg=C["paper"], highlightthickness=1, highlightbackground=C["line"])
+        det.pack(fill="x", padx=14, pady=12)
+        head = tk.Frame(det, bg=C["paper"], padx=16, pady=10)
+        head.pack(fill="x")
+        self.det_title = tk.Label(head, text="Sendungsverlauf", bg=C["paper"], fg=C["ink"], font=F["section"])
+        self.det_title.pack(side="left")
+        self.btn_dhl = FlatButton(head, "Bei DHL öffnen ↗", self.open_dhl, "ghost")
+        self.btn_dhl.pack(side="right")
+        self.btn_copy = FlatButton(head, "Nummer kopieren", self.copy_number, "ghost")
+        self.btn_copy.pack(side="right", padx=(0, 6))
+        self.events = tk.Text(det, height=8, relief="flat", bd=0, bg=C["paper"], font=F["body"], padx=16,
+                              wrap="word", cursor="arrow")
+        self.events.pack(fill="x", pady=(0, 10))
+        self.events.tag_configure("time", foreground=C["muted"], font=F["mono"])
+        self.events.tag_configure("place", foreground=C["muted"])
+        self.events.tag_configure("muted", foreground=C["muted"])
+        self.events.configure(state="disabled")
+
+        self.bind("<Escape>", lambda ev: self.destroy())
+        center_over(self, master, (1180, 720))
+        self.after(100, self._poll)
+        self.reload()
+
+    # ----- Daten
+    def _selected_days(self):
+        return int(self.days.get().split()[0])
+
+    def reload(self, force=False):
+        """Archiv neu lesen, gespeicherte DHL-Stände anzeigen und offene Sendungen bei DHL abfragen."""
+        if self.running:
+            return
+        trk = DHLTracking(self.cfg)
+        if trk.missing:
+            messagebox.showinfo(APP_NAME, "Für die Sendungsverfolgung fehlt noch:\n\n• " + "\n• ".join(trk.missing)
+                                + "\n\nBitte unter Einstellungen → DHL-Zugang… eintragen.", parent=self)
+            return
+        self.running = True
+        self.btn_refresh.state(["disabled"])
+        self.info_label.configure(text="Lade Sendungen…")
+        days = self._selected_days()
+
+        def run():
+            try:
+                store = TrackingStore()
+                archive, cache = tracking_archive(days), store.load()
+                self.q.put(("data", (archive, cache)))
+                limit = (dt.datetime.now() - dt.timedelta(minutes=TRACK_RECHECK_MIN)).isoformat(timespec="seconds")
+                todo = [n for n in archive if not cache.get(n, {}).get("delivered")
+                        and (force or cache.get(n, {}).get("checked", "") < limit)]
+                for i in range(0, len(todo), trk.BATCH):
+                    part = todo[i:i + trk.BATCH]
+                    self.q.put(("progress", f"Frage DHL ab… {i + len(part)} von {len(todo)}"))
+                    now = dt.datetime.now().isoformat(timespec="seconds")
+                    got = {n: {**r, "checked": now} for n, r in trk.query(part).items() if n in part}
+                    cache = store.save(got)
+                    self.q.put(("data", (archive, cache)))
+                    time.sleep(0.4)  # DHL erlaubt höchstens 3 Abfragen je Sekunde
+                self.q.put(("done", len(todo)))
+            except Exception as e:
+                self.q.put(("error", e))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _poll(self):
+        if not self.winfo_exists():
+            return
+        try:
+            while True:
+                kind, val = self.q.get_nowait()
+                if kind == "data":
+                    self.archive, self.info = val
+                    self._fill()
+                elif kind == "progress":
+                    self.info_label.configure(text=val)
+                elif kind in ("done", "error"):
+                    self.running = False
+                    self.btn_refresh.state(["!disabled"])
+                    stamp = dt.datetime.now().strftime("%H:%M")
+                    if kind == "done":
+                        self.info_label.configure(text=f"Stand {stamp} – {val} Sendungen bei DHL abgefragt"
+                                                  if val else f"Stand {stamp} – alles aktuell")
+                    else:
+                        self.info_label.configure(text="Abfrage fehlgeschlagen")
+                        messagebox.showerror(APP_NAME, f"Sendungsverfolgung fehlgeschlagen:\n\n{val}", parent=self)
+        except queue.Empty:
+            pass
+        self.after(150, self._poll)
+
+    # ----- Anzeige
+    def _fill(self):
+        keep = self.tree.focus()
+        words = self.search.get().lower().split()
+        self.rows, counts = [], dict.fromkeys(TRACK_FILTERS, 0)
+        for num, a in sorted(self.archive.items(), key=lambda kv: kv[1]["sent"], reverse=True):
+            info = self.info.get(num)
+            cat, text = tracking_state(info, a["sent"])
+            hay = " ".join((num, a["ref"], a["name"], text)).lower()
+            if words and not all(w in hay for w in words):
+                continue
+            tab = {"problem": "Probleme", "achtung": "Probleme", "zugestellt": "Zugestellt"}.get(cat, "Unterwegs")
+            counts["Alle"] += 1
+            counts[tab] += 1
+            if self.filter.get() in ("Alle", tab):
+                self.rows.append((num, a, info, cat, text))
+        self.tabs.update_counts(counts)
+        self.tree.delete(*self.tree.get_children())
+        mark = {"problem": "⚠  ", "achtung": "●  ", "zugestellt": "✓  "}
+        for num, a, info, cat, text in self.rows:
+            last = (info or {}).get("time", "")
+            self.tree.insert("", "end", iid=num, tags=(cat,), values=(
+                a["sent"].strftime("%d.%m.%Y %H:%M"), a["ref"], a["name"], num, mark.get(cat, "") + text,
+                last[:16], a["via"]))
+        if keep and self.tree.exists(keep):
+            self.tree.focus(keep)
+            self.tree.selection_set(keep)
+        self._show_events()
+
+    def _current(self):
+        num = self.tree.focus()
+        return num if num and num in self.archive else None
+
+    def _show_events(self):
+        num = self._current()
+        t = self.events
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        if not num:
+            self.det_title.configure(text="Sendungsverlauf")
+            t.insert("end", "Sendung in der Liste auswählen.", ("muted",))
+        else:
+            a, info = self.archive[num], self.info.get(num) or {}
+            self.det_title.configure(text=f"Sendungsverlauf {num} – Auftrag {a['ref']}, {a['name']}")
+            if info.get("error"):
+                t.insert("end", info["error"], ("muted",))
+            elif not info.get("events"):
+                t.insert("end", "Noch keine Ereignisse von DHL.", ("muted",))
+            for n, ev in enumerate(reversed(info.get("events", []))):  # neuestes oben
+                t.insert("end", ("\n" if n else "") + f"{ev['time'][:16]:<16}  ", ("time",))
+                t.insert("end", ev["text"])
+                if ev["place"]:
+                    t.insert("end", f"  ·  {ev['place']}", ("place",))
+        t.configure(state="disabled")
+        for b in (self.btn_dhl, self.btn_copy):
+            b.state(["!disabled"] if num else ["disabled"])
+
+    def open_dhl(self):
+        num = self._current()
+        if num:
+            import webbrowser
+            webbrowser.open(DHL_TRACK_PAGE.format(urllib.parse.quote(num)))
+
+    def copy_number(self):
+        num = self._current()
+        if num:
+            self.clipboard_clear()
+            self.clipboard_append(num)
+            self.info_label.configure(text=f"{num} kopiert")
+
+    def _context_menu(self, e):
+        iid = self.tree.identify_row(e.y)
+        if not iid:
+            return
+        self.tree.focus(iid)
+        self.tree.selection_set(iid)
+        m = tk.Menu(self, tearoff=0)
+        m.add_command(label="Bei DHL öffnen", command=self.open_dhl)
+        m.add_command(label="Sendungsnummer kopieren", command=self.copy_number)
+        m.tk_popup(e.x_root, e.y_root)
 
 
 def selftest(path):

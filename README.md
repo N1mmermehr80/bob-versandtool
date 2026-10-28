@@ -1,4 +1,4 @@
-# BOB Sendcloud-Versand
+# S4T Versandzentrale
 
 Holt offene Aufträge direkt aus Speed4Trade CONNECT (oder liest den S4T-Versandexport `GLS_*.csv`), legt ausgewählte Aufträge als DHL-Sendung bei Sendcloud an und meldet die Sendungsnummern an Speed4Trade zurück (bzw. exportiert sie als CSV).
 
