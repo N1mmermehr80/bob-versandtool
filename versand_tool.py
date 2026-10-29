@@ -2082,21 +2082,23 @@ class App(tk.Tk):
         self.btn_s4t = FlatButton(bar, "Aus S4T abholen", self.fetch_s4t, "bar")
         self.btn_s4t.pack(side="left")
         self.btn_open = FlatButton(bar, "CSV importieren…", self.open_file, "bar")
-        self.btn_open.pack(side="left", padx=(2, 0))
+        self.btn_open.pack(side="left", padx=(6, 0))
+        self.btn_new = FlatButton(bar, "Sendung erfassen…", self.new_shipment, "bar")
+        self.btn_new.pack(side="left", padx=(6, 0))
         # Bearbeiten/Manuell/Löschen gibt es auch per Doppelklick, Rechtsklick und Entf – bei schmalem Fenster
         # werden sie ausgeblendet, damit Senden/Drucken/Exportieren rechts nie abgeschnitten werden
         edit_box = tk.Frame(bar, bg=C["steel"])
         tk.Frame(edit_box, bg=C["steel_line"], width=1).pack(side="left", fill="y", padx=10, pady=4)
         for text, cmd in (("Bearbeiten", self.edit_current), ("Manuell versendet…", self.mark_manual),
                           ("Löschen", self.delete_orders)):
-            FlatButton(edit_box, text, cmd, "bar").pack(side="left", padx=(0, 2))
+            FlatButton(edit_box, text, cmd, "bar").pack(side="left", padx=(0, 6))
 
         def fit_bar():
             # nach dem Layout ausführen, sonst sind die benötigten Breiten beim Start noch nicht berechnet
             shown = edit_box.winfo_ismapped()
             show = bar.winfo_width() >= bar.winfo_reqwidth() + (0 if shown else edit_box.winfo_reqwidth())
             if show and not shown:
-                edit_box.pack(side="left", fill="y", after=self.btn_open)
+                edit_box.pack(side="left", fill="y", after=self.btn_new)
             elif not show and shown:
                 edit_box.pack_forget()
         edit_box.pack(side="left", fill="y")
@@ -2106,10 +2108,10 @@ class App(tk.Tk):
         self.btn_send = FlatButton(bar, "Ausgewählte senden", self.send_selected, "primary")
         self.btn_send.pack(side="right", padx=(8, 0))
         self.btn_export = FlatButton(bar, "Exportieren…", self.export, "bar")
-        self.btn_export.pack(side="right", padx=(2, 0))
+        self.btn_export.pack(side="right", padx=(6, 0))
         self.btn_print = FlatButton(bar, "Labels drucken…", self.print_labels, "bar")
         self.btn_print.pack(side="right")
-        FlatButton(bar, "Sendungsverfolgung", self.tracking, "bar").pack(side="right", padx=(0, 2))
+        FlatButton(bar, "Sendungsverfolgung", self.tracking, "bar").pack(side="right", padx=(0, 6))
 
         # ── Update-Hinweis (nur sichtbar, wenn eine neue Version bereitsteht)
         self.update_bar = tk.Frame(self, bg=C["signal"], padx=14, pady=7)
@@ -2602,8 +2604,8 @@ class App(tk.Tk):
         # Artikel
         items = []
         for n, i in enumerate(o.items):
-            items += [(("\n\n" if n else "") + f'{i["qty"]:g} × {i["sku"]}', "b"),
-                      (f'   {fmt_eur(i["price"])}', "muted"), ("\n" + i["name"], "small")]
+            items += [(("\n\n" if n else "") + f'{i["qty"]:g} × {i["sku"] or i["name"]}', "b"),
+                      (f'   {fmt_eur(i["price"])}', "muted")] + ([("\n" + i["name"], "small")] if i["sku"] else [])
         for d in o.discounts:
             items += [(f'\n\n{d["name"] or d["sku"]}   {fmt_eur(d["price"])}', "muted"),
                       ("\nnicht im Paket, vom Warenwert abgezogen", "small_muted")]
@@ -2660,7 +2662,7 @@ class App(tk.Tk):
             if not self.cfg.s4t_ready:
                 return
         self.busy = True
-        for b in (self.btn_send, self.btn_open, self.btn_export, self.btn_s4t):
+        for b in (self.btn_send, self.btn_open, self.btn_new, self.btn_export, self.btn_s4t):
             b.state(["disabled"])
         self.status.set("Hole offene Aufträge aus Speed4Trade…")
         self.progress.configure(mode="indeterminate")
@@ -2675,7 +2677,7 @@ class App(tk.Tk):
 
     def _s4t_fetched(self, result):
         self.busy = False
-        for b in (self.btn_send, self.btn_open, self.btn_export, self.btn_s4t):
+        for b in (self.btn_send, self.btn_open, self.btn_new, self.btn_export, self.btn_s4t):
             b.state(["!disabled"])
         self.progress.stop()
         self.progress.configure(mode="determinate", value=0)
@@ -2907,7 +2909,7 @@ class App(tk.Tk):
         if self.busy:
             return
         self.busy = True
-        for b in (self.btn_send, self.btn_open, self.btn_export, self.btn_s4t):
+        for b in (self.btn_send, self.btn_open, self.btn_new, self.btn_export, self.btn_s4t):
             b.state(["disabled"])
         self.status.set("Lade Erfahrungswerte (Gewicht/Pakete) aus früheren Sendungen…")
         self.progress.configure(mode="indeterminate")
@@ -2938,6 +2940,28 @@ class App(tk.Tk):
             return
         EditDialog(self, o)
         self._after_change(iid)
+
+    def new_shipment(self):
+        """Sendung ohne Auftrag aus S4T/CSV von Hand erfassen (z. B. Nachlieferung, Ersatzteil an Werkstatt).
+        Sie läuft danach wie jeder andere Auftrag: Senden, Drucken, Export."""
+        if self.busy:
+            return
+        o = Order(dt.datetime.now().strftime("M-%Y%m%d-%H%M%S"))
+        o.country = self.cfg["sender_country"] or "DE"
+        o.weight, o.weight_source = _num(self.cfg["default_weight_kg"]) or 2.01, "manuell"
+        taken = {x.ref for x in self.orders} | set(self.completed) | set(self.deleted)
+        dlg = NewShipmentDialog(self, o, taken)
+        if not dlg.saved:
+            return
+        append_log(o, "manuell erfasst")
+        self._add_orders([o], self.source, "Sendung erfasst", quiet=True)
+        for i, x in enumerate(self.orders):
+            if x.ref == o.ref and self.tree.exists(str(i)):
+                self.tree.focus(str(i))
+                self.tree.selection_set(str(i))
+                self.tree.see(str(i))
+                self._show_details()
+                break
 
     def settings(self, page="Allgemein"):
         SettingsDialog(self, self.cfg, page)
@@ -3016,7 +3040,7 @@ class App(tk.Tk):
         if not messagebox.askyesno(APP_NAME, msg):
             return
         self.busy = True
-        for b in (self.btn_send, self.btn_open, self.btn_export, self.btn_s4t):
+        for b in (self.btn_send, self.btn_open, self.btn_new, self.btn_export, self.btn_s4t):
             b.state(["disabled"])
         self.progress.configure(maximum=len(sel), value=0)
         threading.Thread(target=self._worker, args=(sel,), daemon=True).start()
@@ -3178,7 +3202,7 @@ class App(tk.Tk):
                 elif kind == "history":
                     data, notify, sc_error = val
                     self.busy = False
-                    for b in (self.btn_send, self.btn_open, self.btn_export, self.btn_s4t):
+                    for b in (self.btn_send, self.btn_open, self.btn_new, self.btn_export, self.btn_s4t):
                         b.state(["!disabled"])
                     self.progress.stop()
                     self.progress.configure(mode="determinate", value=0)
@@ -3202,7 +3226,7 @@ class App(tk.Tk):
                     self._update_status()
                 elif kind == "done":
                     self.busy = False
-                    for b in (self.btn_send, self.btn_open, self.btn_export, self.btn_s4t):
+                    for b in (self.btn_send, self.btn_open, self.btn_new, self.btn_export, self.btn_s4t):
                         b.state(["!disabled"])
                     self.save_session()
                     run = val  # nur die Aufträge dieses Durchlaufs zählen, nicht ältere Ergebnisse in der Liste
@@ -3844,6 +3868,10 @@ def build_palette(theme="Standard", bar="", accent=""):
     pal["steel_text"] = _mix(pal["steel"], pal["on_steel"], 0.82)
     pal["steel_hover"] = _mix(pal["steel"], pal["on_steel"], 0.10)
     pal["steel_line"] = _mix(pal["steel"], pal["on_steel"], 0.20)
+    # Knöpfe in der Kopfleiste: eigene Fläche und Rahmen, damit sie auch ohne Maus als Knöpfe erkennbar sind
+    pal["steel_btn"] = _mix(pal["steel"], pal["on_steel"], 0.09)
+    pal["steel_btn_hover"] = _mix(pal["steel"], pal["on_steel"], 0.20)
+    pal["steel_btn_edge"] = _mix(pal["steel"], pal["on_steel"], 0.30)
     pal["on_select"] = dark_ink if _light(pal["select"]) else "#FFFFFF"
     pal["on_signal"] = dark_ink if _light(pal["signal"]) else "#FFFFFF"
     pal["signal_hover"] = _mix(pal["signal"], "#FFFFFF", 0.15)
@@ -4028,16 +4056,20 @@ class FlatButton(tk.Label):
     @staticmethod
     def variants():
         return {
-            "bar": dict(bg=C["steel"], fg=C["steel_text"], hover=C["steel_hover"], hfg=C["on_steel"], font="button"),
+            "bar": dict(bg=C["steel_btn"], fg=C["on_steel"], hover=C["steel_btn_hover"], hfg=C["on_steel"],
+                        font="button", edge=C["steel_btn_edge"]),
             "primary": dict(bg=C["signal"], fg=C["on_signal"], hover=C["signal_hover"], hfg=C["on_signal"],
-                            font="button"),
+                            font="button", edge=C["signal_edge"]),
             "ghost": dict(bg=C["hall"], fg=C["ink"], hover=C["hover"], hfg=C["ink"], font="body"),
         }
 
     def __init__(self, master, text, command, variant="ghost"):
         v = self.variants()[variant]
+        edge = v.get("edge")
         super().__init__(master, text=text, bg=v["bg"], fg=v["fg"], font=F[v["font"]], cursor="hand2",
-                         padx=16 if variant == "primary" else 11, pady=6)
+                         padx=16 if variant == "primary" else 11, pady=5 if edge else 6,
+                         highlightthickness=1 if edge else 0, highlightbackground=edge or v["bg"],
+                         highlightcolor=edge or v["bg"])
         self.v, self.command, self._disabled = v, command, False
         self.bind("<Enter>", lambda e: self._disabled or self.configure(bg=v["hover"], fg=v["hfg"]))
         self.bind("<Leave>", lambda e: self._disabled or self.configure(bg=v["bg"], fg=v["fg"]))
@@ -4045,7 +4077,7 @@ class FlatButton(tk.Label):
 
     def state(self, flags):
         self._disabled = "disabled" in flags
-        self.configure(fg=C["faint"] if self._disabled else self.v["fg"], bg=self.v["bg"],
+        self.configure(fg=_mix(self.v["bg"], self.v["fg"], 0.45) if self._disabled else self.v["fg"], bg=self.v["bg"],
                        cursor="arrow" if self._disabled else "hand2")
 
 
@@ -4276,8 +4308,8 @@ class EditDialog(tk.Toplevel):
 
     def __init__(self, master, order: Order):
         super().__init__(master)
-        self.o = order
-        self.title(f"Auftrag {order.ref} bearbeiten")
+        self.o, self.saved = order, False
+        self.title(self._title())
         self.resizable(False, False)
         self.transient(master)
         f = ttk.Frame(self, padding=12)
@@ -4285,15 +4317,15 @@ class EditDialog(tk.Toplevel):
         self.vars = {}
         for r, (k, label) in enumerate(self.FIELDS):
             ttk.Label(f, text=label).grid(row=r, column=0, sticky="w", pady=2)
-            v = getattr(order, k)
-            self.vars[k] = tk.StringVar(value=(f"{v:.2f}".replace(".", ",") if k == "weight" else str(v)))
+            v = self._initial(k)
+            self.vars[k] = tk.StringVar(value=(f"{v:.2f}".replace(".", ",") if isinstance(v, float) else str(v)))
             e = ttk.Entry(f, textvariable=self.vars[k], width=45)
             e.grid(row=r, column=1, sticky="w", padx=(8, 0), pady=2)
             if r == 0:
                 e.focus_set()
         b = ttk.Frame(f)
         b.grid(row=len(self.FIELDS), column=0, columnspan=2, sticky="e", pady=(10, 0))
-        ttk.Button(b, text="Übernehmen", command=self.ok).pack(side="left")
+        ttk.Button(b, text=self.OK_TEXT, command=self.ok).pack(side="left")
         ttk.Button(b, text="Abbrechen", command=self.destroy).pack(side="left", padx=(6, 0))
         self.bind("<Return>", lambda e: self.ok())
         self.bind("<Escape>", lambda e: self.destroy())
@@ -4301,21 +4333,35 @@ class EditDialog(tk.Toplevel):
         self.grab_set()
         self.wait_window()
 
+    OK_TEXT = "Übernehmen"
+
+    def _title(self):
+        return f"Auftrag {self.o.ref} bearbeiten"
+
+    def _initial(self, k):
+        return getattr(self.o, k)
+
     def ok(self):
+        if self.apply():
+            self.saved = True
+            self.destroy()
+
+    def apply(self):
+        """Eingaben prüfen und in den Auftrag übernehmen. False: Fehler wurde angezeigt, Dialog bleibt offen."""
         w = _num(self.vars["weight"].get())
         if w is None or not (0 < w <= 31.5):
             messagebox.showerror(APP_NAME, "Gewicht muss zwischen 0 und 31,5 kg liegen.", parent=self)
-            return
+            return False
         n = self.vars["parcels"].get().strip()
         if not n.isdigit() or not (1 <= int(n) <= 20):
             messagebox.showerror(APP_NAME, "Anzahl Pakete muss zwischen 1 und 20 liegen.", parent=self)
-            return
+            return False
         em = self.vars["email"].get().strip()
         if em and not EMAIL_RX.match(em):
             messagebox.showerror(APP_NAME, "E-Mail-Adresse ist ungültig.", parent=self)
-            return
+            return False
         for k, _ in self.FIELDS:
-            if k == "parcels":
+            if k in ("parcels", "ref") or not hasattr(self.o, k):
                 continue
             if k == "weight":
                 if abs(w - self.o.weight) > 1e-9 or int(n) != self.o.parcels:
@@ -4330,6 +4376,52 @@ class EditDialog(tk.Toplevel):
         self.o.error = ""
         if self.o.status == "Fehler":
             self.o.status = "neu"
+        return True
+
+
+class NewShipmentDialog(EditDialog):
+    """Sendung von Hand erfassen: Referenz, Empfänger, Inhalt, Warenwert, Pakete und Gewicht."""
+    FIELDS = ([("ref", "Referenz")] + EditDialog.FIELDS[:10] +
+              [("content", "Inhalt"), ("price", "Warenwert (€)")] + EditDialog.FIELDS[10:])
+    OK_TEXT = "Sendung anlegen"
+
+    def __init__(self, master, order: Order, taken):
+        self.taken = taken
+        super().__init__(master, order)
+
+    def _title(self):
+        return "Sendung manuell erfassen"
+
+    def _initial(self, k):
+        return {"content": "Ersatzteile", "price": "0,00"}.get(k) or getattr(self.o, k)
+
+    def ok(self):
+        ref = self.vars["ref"].get().strip()
+        # Referenz wird Dateiname im gemeinsamen Ordner und Sendungsreferenz bei Sendcloud/DHL
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,29}", ref):
+            messagebox.showerror(APP_NAME, "Referenz: 1–30 Zeichen, nur Buchstaben, Ziffern, - und _.", parent=self)
+            return
+        if ref in self.taken:
+            messagebox.showerror(APP_NAME, f"Die Referenz {ref} ist schon vergeben (in der Liste oder bereits "
+                                           "erledigt). Bitte eine andere wählen.", parent=self)
+            return
+        price = _num(self.vars["price"].get() or "0")
+        if price is None or price < 0:
+            messagebox.showerror(APP_NAME, "Warenwert ist ungültig.", parent=self)
+            return
+        content = self.vars["content"].get().strip()
+        if not content:
+            messagebox.showerror(APP_NAME, "Bitte den Inhalt angeben.", parent=self)
+            return
+        if not self.apply():
+            return
+        self.o.ref = ref
+        self.o.items = [{"sku": "", "name": content, "qty": 1, "price": round(price, 2), "ean": "", "weight": None}]
+        errors = self.o.validate()
+        if errors:
+            messagebox.showerror(APP_NAME, "Bitte ergänzen:\n\n• " + "\n• ".join(errors), parent=self)
+            return
+        self.saved = True
         self.destroy()
 
 

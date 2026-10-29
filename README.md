@@ -22,6 +22,8 @@ Holt offene Aufträge direkt aus Speed4Trade CONNECT (oder liest den S4T-Versand
    - Sendcloud liefert DHL-Labels in einem Sonderformat (~69 × 140 mm). Das Tool setzt sie automatisch formatfüllend auf echtes A6 (105 × 148 mm).
 6. **💾 Exportieren:** Sendungsnummern als CSV (`Auftragsnummer;Sendungsnummer`) speichern.
 
+**Sendung erfassen…:** Legt eine Sendung ohne Auftrag aus Speed4Trade oder CSV von Hand an (z. B. Nachlieferung, Ersatzteil an eine Werkstatt): Referenz (vorbelegt mit `M-Datum-Uhrzeit`, frei änderbar), Empfänger, Inhalt, Warenwert, Pakete und Gewicht. Danach läuft sie wie jeder andere Auftrag: Senden, Drucken, Export. Eine Rückmeldung an Speed4Trade gibt es dafür nicht.
+
 **✔ Manuell versendet:** Markiert einen Auftrag ohne Sendcloud als versendet, mit oder ohne Sendungsnummer, z. B. bei Abholung. Mit Sendungsnummer erscheint er im Export. Ein zweiter Klick nimmt die Markierung zurück.
 
 **🗑 Löschen** (oder Entf-Taste): Entfernt die angehakten Aufträge aus der Liste, ohne Häkchen die markierte Zeile. Das Label wird dabei **nicht** in Sendcloud storniert. Lädst du später eine Exportdatei, die gelöschte Aufträge enthält, fragt das Tool, ob sie wieder angezeigt werden sollen.
