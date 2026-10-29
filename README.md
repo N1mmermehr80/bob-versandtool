@@ -24,6 +24,10 @@ Holt offene Aufträge direkt aus Speed4Trade CONNECT (oder liest den S4T-Versand
 
 **Sendung erfassen…:** Legt eine Sendung ohne Auftrag aus Speed4Trade oder CSV von Hand an (z. B. Nachlieferung, Ersatzteil an eine Werkstatt): Referenz (vorbelegt mit `M-Datum-Uhrzeit`, frei änderbar), Empfänger, Inhalt, Warenwert, Pakete und Gewicht. Danach läuft sie wie jeder andere Auftrag: Senden, Drucken, Export. Eine Rückmeldung an Speed4Trade gibt es dafür nicht.
 
+**Neue Sendung aus dem Archiv:** In der Sendungsverfolgung eine frühere Sendung auswählen → **Neue Sendung daraus…** (Knopf oder Rechtsklick), z. B. für eine Nachlieferung. Empfänger, Inhalt, Warenwert und Pakete werden übernommen, die Referenz wird `<Auftrag>-2`, `-3` … Die Daten kommen aus der Liste, aus dem gemeinsamen Ordner (erledigte Aufträge ab Version 1.0.19) oder aus Speed4Trade.
+
+**Selbstabholer** (Versandart „Selbstabholung“ bzw. eBay-Kennzeichen ISPU) werden beim Abholen aus Speed4Trade übersprungen; bereits vorhandene, unbearbeitete werden aus der Liste genommen.
+
 **✔ Manuell versendet:** Markiert einen Auftrag ohne Sendcloud als versendet, mit oder ohne Sendungsnummer, z. B. bei Abholung. Mit Sendungsnummer erscheint er im Export. Ein zweiter Klick nimmt die Markierung zurück.
 
 **🗑 Löschen** (oder Entf-Taste): Entfernt die angehakten Aufträge aus der Liste, ohne Häkchen die markierte Zeile. Das Label wird dabei **nicht** in Sendcloud storniert. Lädst du später eine Exportdatei, die gelöschte Aufträge enthält, fragt das Tool, ob sie wieder angezeigt werden sollen.

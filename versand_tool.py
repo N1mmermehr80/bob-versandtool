@@ -1203,6 +1203,7 @@ class S4T:
         self.host = cfg["s4t_host"].strip()
         self.pin = cfg["s4t_cert_sha256"].strip().upper()
         self.auth = "Basic " + base64.b64encode(f'{cfg["s4t_user"]}:{cfg.s4t_password}'.encode()).decode()
+        self.pickups = set()  # Auftragsnummern der übersprungenen Selbstabholer (letztes fetch_orders)
 
     def _call(self, method, request_xml):
         param = S4T_PARAM.get(method, "requestData")
@@ -1253,14 +1254,19 @@ class S4T:
 
     def fetch_orders(self, default_weight):
         """Aufträge im eingestellten Status (130 = bezahlt, Versand offen), optional nur mit einem Kennzeichen.
-        Dazu Shop-Aufträge in den weiteren Status (240), sofern noch nicht versendet."""
+        Dazu Shop-Aufträge in den weiteren Status (240), sofern noch nicht versendet. Selbstabholer werden
+        übersprungen (kein Versand, Abholung und Status pflegt das Team in CONNECT)."""
         main, *extra = s4t_statuses(self.cfg)
         orders, seen = [], set()
+        self.pickups = set()
         for status in (main, *extra):
             for x in self._fetch_status(status):
                 if x.findtext("order_id") in seen:
                     continue
                 if status != main and not s4t_shop_open(x):
+                    continue
+                if s4t_pickup(x):
+                    self.pickups.add((x.findtext("order_number") or "").strip())
                     continue
                 seen.add(x.findtext("order_id"))
                 orders.append(s4t_order(x, default_weight))
@@ -1343,6 +1349,13 @@ def s4t_shop_open(x):
     if "COMMERCE" not in (x.findtext(".//sub_channel/sub_channel_identifier") or "").upper():
         return False
     return not any((e.text or "").strip() for tag in ("tracking_number", "packet_id") for e in x.iter(tag))
+
+
+def s4t_pickup(x):
+    """Selbstabholer: Versandart „Selbstabholung“ oder eBay-Kennzeichen ISPU (In-Store-Pickup)."""
+    if "abhol" in (x.findtext("dispatch_type/identifier") or "").lower():
+        return True
+    return any((t.text or "").strip().upper() == "ISPU" for t in x.iter("tag_identifier"))
 
 
 def s4t_order(x, default_weight):
@@ -1615,7 +1628,7 @@ def lock_fresh(data):
 class FolderBackend:
     """Arbeitsliste als Dateien in einem Netzwerkordner – ohne Server, ohne Adminrechte.
     auftraege/<ref>.json  je Auftrag (mit Versionsnummer)   sperren/<ref>.lock  kurze Schreibsperre
-    ausgeblendet/<ref>.json  gelöscht/erledigt               labels/*.pdf        protokoll/<benutzer>.csv"""
+    ausgeblendet/<ref>.json  gelöscht/erledigt (erledigte mit Auftragsdaten)  labels/*.pdf  protokoll/<benutzer>.csv"""
 
     def __init__(self, root, user):
         self.root, self.user = root, user
@@ -1778,14 +1791,20 @@ class FolderBackend:
                                                        "updated_by": self.user, "updated_at": now})
             return "added"
 
-    def hide(self, ref, kind):
+    def hide(self, ref, kind, data=None):
+        rec = {"ref": ref, "kind": kind, "by": self.user, "at": dt.datetime.now().isoformat(timespec="seconds")}
+        if data:
+            rec["data"] = data
         with self.mutex, self._locked(ref):
-            self._write(self._path("ausgeblendet", ref), {"ref": ref, "kind": kind, "by": self.user,
-                                                         "at": dt.datetime.now().isoformat(timespec="seconds")})
+            self._write(self._path("ausgeblendet", ref), rec)
             try:
                 os.remove(self._path("auftraege", ref))
             except FileNotFoundError:
                 pass
+
+    def archived(self, ref):
+        """Auftragsdaten eines erledigten Auftrags (seit 1.0.19 gespeichert), sonst leer."""
+        return self._read(self._path("ausgeblendet", ref)).get("data") or {}
 
     def unhide(self, ref):
         try:
@@ -2670,7 +2689,9 @@ class App(tk.Tk):
 
         def run():
             try:
-                self.q.put(("s4t", S4T(self.cfg).fetch_orders(_num(self.cfg["default_weight_kg"]) or 2.01)))
+                s4t = S4T(self.cfg)
+                orders = s4t.fetch_orders(_num(self.cfg["default_weight_kg"]) or 2.01)
+                self.q.put(("s4t", (orders, s4t.pickups)))
             except Exception as e:
                 self.q.put(("s4t", e))
         threading.Thread(target=run, daemon=True).start()
@@ -2685,14 +2706,16 @@ class App(tk.Tk):
             self._update_status("Abholen aus Speed4Trade fehlgeschlagen.")
             messagebox.showerror(APP_NAME, f"Abholen aus Speed4Trade fehlgeschlagen:\n\n{result}")
             return
+        result, pickups = result
+        removed = self._prune_s4t({o.ref for o in result}, pickups)
         if not result:
-            self._update_status("Speed4Trade: keine neuen Aufträge.")
+            self._update_status("Speed4Trade: keine neuen Aufträge."
+                                + (f" {removed} Aufträge entfernt." if removed else ""))
             tag = self.cfg["s4t_tag"].strip()
             messagebox.showinfo(APP_NAME, "In Speed4Trade sind keine offenen Aufträge"
                                 + (f" mit dem Kennzeichen „{tag}“." if tag else "."))
             return
         self._add_orders(result, "Speed4Trade", "Abholung aus Speed4Trade")
-        removed = self._prune_s4t({o.ref for o in result})
         if removed:
             self._update_status(f"{removed} Aufträge entfernt, die in Speed4Trade nicht mehr offen sind.")
 
@@ -2703,7 +2726,9 @@ class App(tk.Tk):
 
             def run():
                 try:
-                    self.q.put(("s4t_auto", S4T(self.cfg).fetch_orders(_num(self.cfg["default_weight_kg"]) or 2.01)))
+                    s4t = S4T(self.cfg)
+                    orders = s4t.fetch_orders(_num(self.cfg["default_weight_kg"]) or 2.01)
+                    self.q.put(("s4t_auto", (orders, s4t.pickups)))
                 except Exception as e:
                     self.q.put(("s4t_auto", e))
             threading.Thread(target=run, daemon=True).start()
@@ -2717,14 +2742,16 @@ class App(tk.Tk):
             return
         if self.busy:
             return  # während Senden/Drucken nichts umbauen – nächster Durchlauf in 5 Minuten
+        result, pickups = result
         added = self._add_orders(result, "Speed4Trade", "Speed4Trade-Abgleich", quiet=True)
-        removed = self._prune_s4t({o.ref for o in result})
+        removed = self._prune_s4t({o.ref for o in result}, pickups)
         self._update_status(f"Speed4Trade abgeglichen {when}: {added} neu, {removed} entfernt, "
                             f"{len(result)} offen.")
 
-    def _prune_s4t(self, open_refs):
-        """Aufträge aus Speed4Trade, die dort nicht mehr offen sind (z. B. von Hand versendet oder storniert) und
-        hier noch unbearbeitet sind, aus der Liste nehmen. Begonnene oder versendete Aufträge bleiben stehen."""
+    def _prune_s4t(self, open_refs, pickups=()):
+        """Aufträge aus Speed4Trade, die dort nicht mehr offen sind (z. B. von Hand versendet oder storniert) oder
+        Selbstabholer sind und hier noch unbearbeitet sind, aus der Liste nehmen. Begonnene oder versendete
+        Aufträge bleiben stehen."""
         stale = [o for o in self.orders if o.s4t_id and o.ref not in open_refs and o.status == "neu"
                  and not o.tracking and not o.selected and not o.busy_elsewhere]
         if not stale:
@@ -2739,7 +2766,8 @@ class App(tk.Tk):
                     continue
             self.completed[o.ref] = stamp
             self._synced.pop(o.ref, None)
-            append_log(o, "in Speed4Trade nicht mehr offen, aus Liste entfernt")
+            append_log(o, "Selbstabholung, aus Liste entfernt" if o.ref in pickups
+                       else "in Speed4Trade nicht mehr offen, aus Liste entfernt")
             removed.append(o)
         self.orders = [o for o in self.orders if o not in removed]
         self.tree.delete(*self.tree.get_children())
@@ -2820,7 +2848,7 @@ class App(tk.Tk):
         for o in finished:
             if BACKEND is not None:
                 try:
-                    BACKEND.hide(o.ref, "completed")
+                    BACKEND.hide(o.ref, "completed", shared_data(o))
                 except (OSError, Conflict):
                     continue  # bleibt stehen, nächster Versuch beim nächsten Drucken/Export/Import
             self.completed[o.ref] = stamp
@@ -2941,19 +2969,32 @@ class App(tk.Tk):
         EditDialog(self, o)
         self._after_change(iid)
 
-    def new_shipment(self):
+    def new_shipment(self, template=None, parent=None):
         """Sendung ohne Auftrag aus S4T/CSV von Hand erfassen (z. B. Nachlieferung, Ersatzteil an Werkstatt).
+        template: früherer Auftrag, dessen Empfänger, Inhalt und Pakete vorbelegt werden (Referenz <ref>-2, -3 …).
         Sie läuft danach wie jeder andere Auftrag: Senden, Drucken, Export."""
         if self.busy:
+            messagebox.showinfo(APP_NAME, "Bitte warten, bis der laufende Vorgang fertig ist.", parent=parent or self)
             return
-        o = Order(dt.datetime.now().strftime("M-%Y%m%d-%H%M%S"))
-        o.country = self.cfg["sender_country"] or "DE"
-        o.weight, o.weight_source = _num(self.cfg["default_weight_kg"]) or 2.01, "manuell"
         taken = {x.ref for x in self.orders} | set(self.completed) | set(self.deleted)
-        dlg = NewShipmentDialog(self, o, taken)
+        content, price = "Ersatzteile", 0.0
+        if template is None:
+            o = Order(dt.datetime.now().strftime("M-%Y%m%d-%H%M%S"))
+            o.country = self.cfg["sender_country"] or "DE"
+            o.weight = _num(self.cfg["default_weight_kg"]) or 2.01
+        else:
+            base = re.sub(r"[^A-Za-z0-9_-]", "", template.ref)[:26] or "M"
+            o = Order(next(f"{base}-{n}" for n in range(2, 1000) if f"{base}-{n}" not in taken))
+            for k in ("name", "company", "street", "house", "addr2", "zip", "city", "country", "email", "phone",
+                      "weight", "parcels"):
+                setattr(o, k, getattr(template, k))
+            names = [i["name"] or i["sku"] for i in template.items]
+            content, price = (", ".join(n for n in names if n)[:100] or content), max(template.value, 0.0)
+        o.weight_source = "manuell"
+        dlg = NewShipmentDialog(parent or self, o, taken, content, price)
         if not dlg.saved:
             return
-        append_log(o, "manuell erfasst")
+        append_log(o, "manuell erfasst" + (f" (aus Auftrag {template.ref})" if template else ""))
         self._add_orders([o], self.source, "Sendung erfasst", quiet=True)
         for i, x in enumerate(self.orders):
             if x.ref == o.ref and self.tree.exists(str(i)):
@@ -2962,6 +3003,30 @@ class App(tk.Tk):
                 self.tree.see(str(i))
                 self._show_details()
                 break
+
+    def archived_order(self, ref):
+        """Früheren Auftrag für „Neue Sendung daraus“ finden: aktuelle Liste, gemeinsamer Ordner (erledigte
+        Aufträge ab 1.0.19), sonst Speed4Trade über die Auftragsnummer. None, wenn nichts gefunden wurde."""
+        for o in self.orders:
+            if o.ref == ref:
+                return o
+        if BACKEND is not None:
+            try:
+                data = BACKEND.archived(ref)
+            except OSError:
+                data = {}
+            if data.get("street"):
+                return Order.from_dict(data)
+        if self.cfg.s4t_ready:
+            s4t = S4T(self.cfg)
+            resp = s4t._call("fetchOrders", '<request method="fetchOrders" version="1.0.0"><filter>'
+                                            f'<order_number filter_method="=" filter_value="{xml_escape(ref)}"/>'
+                                            '</filter><use_modification_context_filter>false'
+                                            '</use_modification_context_filter></request>')
+            x = resp.find("order")
+            if x is not None:
+                return s4t_order(x, _num(self.cfg["default_weight_kg"]) or 2.01)
+        return None
 
     def settings(self, page="Allgemein"):
         SettingsDialog(self, self.cfg, page)
@@ -4385,15 +4450,15 @@ class NewShipmentDialog(EditDialog):
               [("content", "Inhalt"), ("price", "Warenwert (€)")] + EditDialog.FIELDS[10:])
     OK_TEXT = "Sendung anlegen"
 
-    def __init__(self, master, order: Order, taken):
-        self.taken = taken
+    def __init__(self, master, order: Order, taken, content="Ersatzteile", price=0.0):
+        self.taken, self.preset = taken, {"content": content, "price": price}
         super().__init__(master, order)
 
     def _title(self):
         return "Sendung manuell erfassen"
 
     def _initial(self, k):
-        return {"content": "Ersatzteile", "price": "0,00"}.get(k) or getattr(self.o, k)
+        return self.preset[k] if k in self.preset else getattr(self.o, k)
 
     def ok(self):
         ref = self.vars["ref"].get().strip()
@@ -5019,6 +5084,8 @@ class TrackingWindow(tk.Toplevel):
         self.btn_dhl.pack(side="right")
         self.btn_copy = FlatButton(head, "Nummer kopieren", self.copy_number, "ghost")
         self.btn_copy.pack(side="right", padx=(0, 6))
+        self.btn_new = FlatButton(head, "Neue Sendung daraus…", self.new_from, "ghost")
+        self.btn_new.pack(side="right", padx=(0, 6))
         self.events = tk.Text(det, height=8, relief="flat", bd=0, bg=C["paper"], font=F["body"], padx=16,
                               wrap="word", cursor="arrow")
         self.events.pack(fill="x", pady=(0, 10))
@@ -5150,7 +5217,7 @@ class TrackingWindow(tk.Toplevel):
                 if ev["place"]:
                     t.insert("end", f"  ·  {ev['place']}", ("place",))
         t.configure(state="disabled")
-        for b in (self.btn_dhl, self.btn_copy):
+        for b in (self.btn_dhl, self.btn_copy, self.btn_new):
             b.state(["!disabled"] if num else ["disabled"])
 
     def open_dhl(self):
@@ -5175,7 +5242,30 @@ class TrackingWindow(tk.Toplevel):
         m = tk.Menu(self, tearoff=0)
         m.add_command(label="Bei DHL öffnen", command=self.open_dhl)
         m.add_command(label="Sendungsnummer kopieren", command=self.copy_number)
+        m.add_separator()
+        m.add_command(label="Neue Sendung daraus…", command=self.new_from)
         m.tk_popup(e.x_root, e.y_root)
+
+    def new_from(self):
+        """Neue Sendung an denselben Empfänger (z. B. Nachlieferung) – Daten aus Liste, Ordner oder Speed4Trade."""
+        num = self._current()
+        if not num:
+            return
+        a, app, err = self.archive[num], self.master, ""
+        self.configure(cursor="watch")
+        self.update()
+        try:
+            template = app.archived_order(a["ref"])
+        except Exception as e:
+            template, err = None, str(e)
+        finally:
+            self.configure(cursor="")
+        if template is None:
+            messagebox.showinfo(APP_NAME, f"Zu Auftrag {a['ref']} wurden keine Empfängerdaten gefunden"
+                                + (f":\n\n{err}" if err else " (weder in der Liste noch in Speed4Trade).")
+                                + "\n\nBitte die Sendung über „Sendung erfassen…“ von Hand anlegen.", parent=self)
+            return
+        app.new_shipment(template, parent=self)
 
 
 def selftest(path):
