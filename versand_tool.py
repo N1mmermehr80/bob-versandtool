@@ -935,8 +935,24 @@ class DHL:
     def return_receivers(self, billing=""):
         """Retouren-Empfänger des Kontos: [(receiverId, Abrechnungsnummer, Beschreibung)]. Nur Empfänger mit
         Abrechnungsnummer können Labels erzeugen."""
-        q = {"countryCode": "DEU", **({"billingNumber": billing} if billing else {})}
-        d = self._call("GET", "/locations?" + urllib.parse.urlencode(q), api=DHL_RETURNS_API)
+        # DHL beantwortet kombinierte Filter (countryCode + billingNumber) mit HTTP 500 – deshalb einzeln und
+        # notfalls ganz ohne Filter; die passende Abrechnungsnummer sucht der Aufrufer aus der Liste heraus
+        tries = ([{"billingNumber": billing}] if billing else []) + [{"countryCode": "deu"}, {}]
+        for n, q in enumerate(tries):
+            try:
+                d = self._call("GET", "/locations" + ("?" + urllib.parse.urlencode(q) if q else ""),
+                               api=DHL_RETURNS_API)
+            except DHLError as e:
+                if n == len(tries) - 1 or "401" in str(e) or "403" in str(e):
+                    raise
+                continue
+            found = self._receivers(d)
+            if found or n == len(tries) - 1:
+                return found
+        return []
+
+    @staticmethod
+    def _receivers(d):
         found = []
 
         def walk(x):
@@ -5124,7 +5140,9 @@ class SettingsDialog(tk.Toplevel):
         try:
             found = DHL(tmp).return_receivers(billing)
         except Exception as e:
-            messagebox.showerror(APP_NAME, f"Empfänger-IDs konnten nicht abgerufen werden:\n\n{e}", parent=self)
+            messagebox.showerror(APP_NAME, f"Empfänger-IDs konnten nicht abgerufen werden:\n\n{e}\n\nAlternativ die "
+                                           "Empfänger-ID im Geschäftskundenportal nachsehen (Retoure → Einstellungen) "
+                                           "und von Hand eintragen.", parent=self)
             return
         finally:
             self.configure(cursor="")
