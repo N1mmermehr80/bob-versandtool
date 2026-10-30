@@ -26,6 +26,8 @@ Holt offene Aufträge direkt aus Speed4Trade CONNECT (oder liest den S4T-Versand
 
 **Neue Sendung aus dem Archiv:** In der Sendungsverfolgung eine frühere Sendung auswählen → **Neue Sendung daraus…** (Knopf oder Rechtsklick), z. B. für eine Nachlieferung. Empfänger, Inhalt, Warenwert und Pakete werden übernommen, die Referenz wird `<Auftrag>-2`, `-3` … Die Daten kommen aus der Liste, aus dem gemeinsamen Ordner (erledigte Aufträge ab Version 1.0.19) oder aus Speed4Trade.
 
+**Retourenlabel (DHL):** Rechtsklick auf einen Auftrag oder in der Sendungsverfolgung **Retourenlabel…** → Kundenadresse prüfen, Gewicht und Warenwert angeben. Das Tool erzeugt über die DHL-Retouren-API ein Label (PDF) und einen QR-Code (für Filiale/Packstation), legt beides im gemeinsamen Ordner unter `retouren` ab und öffnet einen E-Mail-Entwurf an den Kunden mit beiden Anhängen. Die Retoure erscheint in der Sendungsverfolgung („Über: Retoure“). Nur aus Deutschland, nicht von Packstationen. Einstellung: DHL → Retoure → Empfänger-ID aus dem Geschäftskundenportal.
+
 **Selbstabholer** (Versandart „Selbstabholung“ bzw. eBay-Kennzeichen ISPU) werden beim Abholen aus Speed4Trade übersprungen; bereits vorhandene, unbearbeitete werden aus der Liste genommen.
 
 **✔ Manuell versendet:** Markiert einen Auftrag ohne Sendcloud als versendet, mit oder ohne Sendungsnummer, z. B. bei Abholung. Mit Sendungsnummer erscheint er im Export. Ein zweiter Klick nimmt die Markierung zurück.

@@ -90,6 +90,7 @@ DEFAULTS = {
     "dhl_billing": "",         # 14-stellige Abrechnungsnummer DHL Paket (EKP + 01 + Teilnahme)
     "dhl_profile": "STANDARD_GRUPPENPROFIL",
     "dhl_print_format": "910-300-400",  # 100 × 150 mm, Thermodruck (Zebra), randlos
+    "dhl_return_receiver": "deu",  # Retouren-Empfänger-ID aus dem GKP (Retoure → Einstellungen)
     "dhl_track_user": "",      # GKP-Benutzer mit Recht „Sendungsverfolgung“ (leer = dhl_user), Passwort verschlüsselt
     "color_theme": "Standard",  # Farbschema (THEMES), pro PC
     "color_bar": "",           # eigene Leistenfarbe #RRGGBB (leer = aus dem Schema)
@@ -101,7 +102,8 @@ SHARED_SETTINGS = ("default_weight_kg", "shipping_option_de", "shipping_option_e
                    "sender_name", "sender_company", "sender_email", "sender_phone", "sender_street",
                    "sender_house_number", "sender_postal_code", "sender_city", "sender_country", "use_history",
                    "s4t_host", "s4t_cert_sha256", "s4t_tag", "s4t_status_id", "s4t_status_extra", "s4t_mandator", "s4t_report",
-                   "carrier", "dhl_sandbox", "dhl_billing", "dhl_profile", "dhl_print_format")
+                   "carrier", "dhl_sandbox", "dhl_billing", "dhl_profile", "dhl_print_format",
+                   "dhl_return_receiver")
 REQUIRED_SENDER = (("sender_company", "Absender Firma"), ("sender_street", "Absender Straße"),
                    ("sender_house_number", "Absender Hausnr."), ("sender_postal_code", "Absender PLZ"),
                    ("sender_city", "Absender Ort"), ("sender_country", "Absender Land"),
@@ -792,6 +794,8 @@ class Sendcloud:
 DHL_API = {False: "https://api-eu.dhl.com", True: "https://api-sandbox.dhl.com"}
 DHL_SANDBOX_LOGIN = ("user-valid", "SandboxPasswort2023!", "33333333330102")  # öffentliche Testdaten von DHL
 DHL_PREFIX = "dhl:"  # parcel_id-Kennung für direkt bei DHL angelegte Sendungen (Sendcloud-IDs sind reine Zahlen)
+DHL_RETURN_PREFIX = "dhlret:"  # parcel_id-Kennung für DHL-Retourenlabels (nur im Protokoll)
+DHL_SHIPPING_API, DHL_RETURNS_API = "/parcel/de/shipping/v2", "/parcel/de/shipping/returns/v1"
 PACKSTATION_RX = re.compile(r"packstation\s*(\d{3})\b", re.I)
 FILIALE_RX = re.compile(r"(?:post)?filiale\s*(\d{3})\b", re.I)
 
@@ -814,8 +818,8 @@ class DHL:
         self._basic = base64.b64encode(f"{self.user}:{self.password}".encode()).decode()
         self._pdfs = {}  # Labels aus der Anlage-Antwort, spart den zweiten Abruf
 
-    def _call(self, method, path, body=None):
-        req = urllib.request.Request(self.base + "/parcel/de/shipping/v2" + path, method=method,
+    def _call(self, method, path, body=None, api=DHL_SHIPPING_API):
+        req = urllib.request.Request(self.base + api + path, method=method,
                                      data=json.dumps(body).encode() if body is not None else None,
                                      headers={"Authorization": "Basic " + self._basic,
                                               "dhl-api-key": self.cfg.dhl_api_key, "Accept": "application/json",
@@ -849,7 +853,8 @@ class DHL:
         msgs = [f'{m.get("property", "")}: {m.get("validationMessage", "")}'.strip(": ")
                 for it in d.get("items") or [] for m in it.get("validationMessages") or []
                 if m.get("validationState") in states]
-        st = d.get("status") or {}
+        st = d.get("status") if isinstance(d.get("status"), dict) else d  # Retouren-API: Fehler auf oberster Ebene
+        st = st.get("sstatus") if isinstance(st.get("sstatus"), dict) else st
         return "; ".join(msgs) or st.get("detail") or st.get("title") or json.dumps(d, ensure_ascii=False)
 
     def _shipper(self):
@@ -925,6 +930,39 @@ class DHL:
                        {"profile": c["dhl_profile"] or "STANDARD_GRUPPENPROFIL", "shipments": [self._shipment(me)]})
         if any((it.get("sstatus") or {}).get("status", 200) >= 400 for it in d.get("items") or []):
             raise DHLError(self._errors(d))
+
+    def create_return(self, o: Order, weight, value, reference):
+        """Retourenlabel: der Kunde (o) ist Absender, Empfänger ist die Retouren-Empfänger-ID aus dem GKP.
+        Rückgabe: (Sendungsnummer, Label-PDF, QR-Code-PNG oder None)."""
+        if PACKSTATION_RX.search(" ".join((o.street, o.addr2, o.company))):
+            raise DHLError("Retouren können nicht von einer Packstation aus beauftragt werden – bitte die "
+                           "Hausadresse des Kunden eintragen")
+        street, house = o.street.strip(), o.house.strip()
+        if not house:  # Hausnummer steht oft mit in der Straße
+            m = re.match(r"^(.*?)[\s,]+(\d+\s*[a-zA-Z]?(?:\s*[-/]\s*\d+\s*[a-zA-Z]?)?)$", street)
+            if m:
+                street, house = m.group(1), m.group(2)
+        shipper = {"name1": (o.company or o.name)[:50], "addressStreet": street[:50], "addressHouse": house[:10],
+                   "postalCode": o.zip.strip(), "city": o.city.strip()[:40]}
+        if o.company and o.name:
+            shipper["name2"] = o.name[:50]
+        if o.addr2:
+            shipper["name3"] = o.addr2[:50]
+        if o.email:
+            shipper["email"] = o.email[:80]
+        if o.phone:
+            shipper["phone"] = o.phone[:20]
+        body = {"receiverId": "deu" if self.sandbox else (self.cfg["dhl_return_receiver"].strip() or "deu"),
+                "customerReference": reference[:30], "shipmentReference": reference[:30], "shipper": shipper,
+                "itemWeight": {"uom": "kg", "value": round(max(weight, 0.01), 3)},
+                "itemValue": {"currency": "EUR", "value": round(max(value, 0), 2)}}
+        if not self.sandbox:  # wie beim Versand: der Vertrag verlangt GoGreen Plus
+            body["services"] = {"goGreenPlus": True}
+        d = self._call("POST", "/orders?labelType=BOTH", body, api=DHL_RETURNS_API)
+        if not d.get("shipmentNo") or not (d.get("label") or {}).get("b64"):
+            raise DHLError(f"Keine Retouren-Sendungsnummer erhalten: {self._errors(d)}")
+        qr = (d.get("qrLabel") or {}).get("b64")
+        return d["shipmentNo"], base64.b64decode(d["label"]["b64"]), base64.b64decode(qr) if qr else None
 
     def existing(self, o: Order):
         """DHL kennt keine Suche nach Auftragsnummer – deshalb in Speed4Trade nachsehen, ob schon eine
@@ -1103,7 +1141,8 @@ def tracking_archive(days):
                 continue
             if sent < since:
                 continue
-            via = "DHL direkt" if row[3].startswith(DHL_PREFIX) else "Sendcloud" if row[3].strip() else "manuell"
+            via = "Retoure" if row[3].startswith(DHL_RETURN_PREFIX) else "DHL direkt" \
+                if row[3].startswith(DHL_PREFIX) else "Sendcloud" if row[3].strip() else "manuell"
             for num in re.split(r"[,;\s]+", row[2]):
                 if not num:
                     continue
@@ -2041,6 +2080,32 @@ def append_log(o: Order, note):
         if new:
             w.writerow(["Zeitpunkt", "Auftragsnummer", "Sendungsnummer", "Parcel-ID", "Empfänger", "Hinweis"])
         w.writerow([dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), o.ref, o.tracking, o.parcel_id, o.name, note])
+
+
+def return_mail(o: Order, number, files, cfg, folder):
+    from email.message import EmailMessage
+    m = EmailMessage()
+    m["To"] = o.email
+    m["Subject"] = f"Ihr Retourenlabel zu Auftrag {o.ref}"
+    m["X-Unsent"] = "1"
+    qr = len(files) > 1
+    m.set_content(
+        f"Guten Tag {o.name or o.company},\n\n"
+        f"anbei erhalten Sie das DHL-Retourenlabel für Ihre Rücksendung zu Auftrag {o.ref}.\n\n"
+        "Bitte drucken Sie das Label (PDF) aus und kleben Sie es gut sichtbar auf das Paket. "
+        + ("Ohne Drucker können Sie stattdessen den QR-Code (Bild im Anhang) in einer DHL-Filiale oder "
+           "Packstation vorzeigen – dort wird das Label für Sie gedruckt. " if qr else "")
+        + f"Die Rücksendung ist für Sie kostenlos.\n\nSendungsnummer der Rücksendung: {number}\n\n"
+        f"Mit freundlichen Grüßen\n{cfg['sender_name'] or ''}\n{cfg['sender_company'] or ''}".rstrip() + "\n")
+    for path in files:
+        with open(path, "rb") as f:
+            data = f.read()
+        kind = ("application", "pdf") if path.endswith(".pdf") else ("image", "png")
+        m.add_attachment(data, maintype=kind[0], subtype=kind[1], filename=os.path.basename(path))
+    path = os.path.join(folder, f"Retoure_{re.sub(r'[^A-Za-z0-9_-]', '', o.ref)}_{number}.eml")
+    with open(path, "wb") as f:
+        f.write(bytes(m))
+    return path
 
 
 # --------------------------------------------------------------------------- Oberfläche
@@ -3004,6 +3069,50 @@ class App(tk.Tk):
                 self._show_details()
                 break
 
+    def create_return(self, template, parent=None):
+        """DHL-Retourenlabel für einen früheren Auftrag: Label (PDF) und QR-Code im Ordner „retouren“ ablegen,
+        im Protokoll vermerken und einen E-Mail-Entwurf an den Kunden öffnen."""
+        parent = parent or self
+        dhl = DHL(self.cfg)
+        if not self.cfg.dhl_api_key or (not dhl.sandbox and not (dhl.user and dhl.password)):
+            messagebox.showinfo(APP_NAME, "Für Retourenlabels fehlen noch die DHL-Zugangsdaten (API-Key, "
+                                          "GKP-Benutzer, Passwort).", parent=parent)
+            self.settings("DHL")
+            return
+        o = Order(template.ref)
+        for k in ("name", "company", "street", "house", "addr2", "zip", "city", "country", "email", "phone"):
+            setattr(o, k, getattr(template, k))
+        dlg = ReturnDialog(parent, o, template.weight or _num(self.cfg["default_weight_kg"]) or 2.01,
+                           max(template.value, 0.0))
+        if not dlg.saved:
+            return
+        parent.configure(cursor="watch")
+        parent.update()
+        try:
+            number, pdf, qr = dhl.create_return(o, dlg.weight, dlg.value, dlg.reference)
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"Retourenlabel konnte nicht erstellt werden:\n\n{e}", parent=parent)
+            return
+        finally:
+            parent.configure(cursor="")
+        folder = os.path.join(BACKEND.root if BACKEND is not None else APP_DIR, "retouren")
+        os.makedirs(folder, exist_ok=True)
+        base = os.path.join(folder, f"Retoure_{re.sub(r'[^A-Za-z0-9_-]', '', o.ref)}_{number}")
+        files = [base + ".pdf"] + ([base + "_QR.png"] if qr else [])
+        for path, data in zip(files, (pdf, qr)):
+            with open(path, "wb") as f:
+                f.write(data)
+        o.tracking, o.parcel_id = number, DHL_RETURN_PREFIX + number
+        append_log(o, "Retourenlabel erstellt" + (" (Testumgebung)" if dhl.sandbox else ""))
+        if dlg.mail and o.email:
+            try:
+                os.startfile(return_mail(o, number, files, self.cfg, folder))
+                return
+            except OSError as e:
+                messagebox.showwarning(APP_NAME, f"E-Mail-Entwurf konnte nicht geöffnet werden:\n{e}\n\n"
+                                                 "Das Label wird stattdessen geöffnet.", parent=parent)
+        os.startfile(files[0])
+
     def archived_order(self, ref):
         """Früheren Auftrag für „Neue Sendung daraus“ finden: aktuelle Liste, gemeinsamer Ordner (erledigte
         Aufträge ab 1.0.19), sonst Speed4Trade über die Auftragsnummer. None, wenn nichts gefunden wurde."""
@@ -3685,6 +3794,7 @@ class App(tk.Tk):
         if o.s4t_id:
             m.add_command(label="An Speed4Trade als versendet melden…", command=self.report_s4t_current,
                           state="normal" if o.tracking and not o.s4t_reported else "disabled")
+        m.add_command(label="Retourenlabel erstellen…", command=lambda: self.create_return(o))
         m.add_separator()
         m.add_command(label="Aus Liste löschen…", command=lambda: self.delete_orders([o]))
         m.tk_popup(e.x_root, e.y_root)
@@ -4388,8 +4498,9 @@ class EditDialog(tk.Toplevel):
             e.grid(row=r, column=1, sticky="w", padx=(8, 0), pady=2)
             if r == 0:
                 e.focus_set()
+        self._extra(f, len(self.FIELDS))
         b = ttk.Frame(f)
-        b.grid(row=len(self.FIELDS), column=0, columnspan=2, sticky="e", pady=(10, 0))
+        b.grid(row=len(self.FIELDS) + 1, column=0, columnspan=2, sticky="e", pady=(10, 0))
         ttk.Button(b, text=self.OK_TEXT, command=self.ok).pack(side="left")
         ttk.Button(b, text="Abbrechen", command=self.destroy).pack(side="left", padx=(6, 0))
         self.bind("<Return>", lambda e: self.ok())
@@ -4405,6 +4516,9 @@ class EditDialog(tk.Toplevel):
 
     def _initial(self, k):
         return getattr(self.o, k)
+
+    def _extra(self, f, row):
+        """Zusätzliche Elemente unter den Feldern (abgeleitete Dialoge)."""
 
     def ok(self):
         if self.apply():
@@ -4486,6 +4600,61 @@ class NewShipmentDialog(EditDialog):
         if errors:
             messagebox.showerror(APP_NAME, "Bitte ergänzen:\n\n• " + "\n• ".join(errors), parent=self)
             return
+        self.saved = True
+        self.destroy()
+
+
+class ReturnDialog(EditDialog):
+    """Retourenlabel: Kundenadresse (Absender der Rücksendung) prüfen, Gewicht, Wert und Referenz."""
+    FIELDS = ([("ref", "Referenz")] + [f for f in EditDialog.FIELDS if f[0] not in ("country", "parcels", "weight")]
+              + [("weight", "Gewicht (kg)"), ("price", "Warenwert (€)")])
+    OK_TEXT = "Retourenlabel erstellen"
+
+    def __init__(self, master, order: Order, weight, value):
+        self.preset = {"ref": f"Retoure {order.ref}", "weight": float(weight), "price": float(value)}
+        self.mail_var = None
+        super().__init__(master, order)
+
+    def _title(self):
+        return f"DHL-Retourenlabel für Auftrag {self.o.ref}"
+
+    def _initial(self, k):
+        return self.preset[k] if k in self.preset else getattr(self.o, k)
+
+    def _extra(self, f, row):
+        self.mail_var = tk.BooleanVar(value=bool(self.o.email))
+        ttk.Checkbutton(f, text="E-Mail-Entwurf mit Label an den Kunden öffnen", variable=self.mail_var).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        if self.o.country and self.o.country != "DE":
+            ttk.Label(f, text=f"Achtung: Kunde in {self.o.country} – Retouren sind nur aus Deutschland eingerichtet.",
+                      foreground=C["amber_ink"]).grid(row=row, column=0, columnspan=2, sticky="e")
+
+    def ok(self):
+        v = {k: self.vars[k].get().strip() for k, _ in self.FIELDS}
+        w, value = _num(v["weight"]), _num(v["price"] or "0")
+        miss = [label for k, label in (("name", "Name"), ("street", "Straße"), ("zip", "PLZ"), ("city", "Ort"))
+                if not v[k]]
+        if miss:
+            messagebox.showerror(APP_NAME, "Bitte ergänzen: " + ", ".join(miss), parent=self)
+            return
+        if not re.fullmatch(r"\d{5}", v["zip"]):
+            messagebox.showerror(APP_NAME, "Retouren sind nur aus Deutschland möglich – PLZ muss 5-stellig sein.",
+                                 parent=self)
+            return
+        if w is None or not (0 < w <= 31.5):
+            messagebox.showerror(APP_NAME, "Gewicht muss zwischen 0 und 31,5 kg liegen.", parent=self)
+            return
+        if value is None or value < 0:
+            messagebox.showerror(APP_NAME, "Warenwert ist ungültig.", parent=self)
+            return
+        if v["email"] and not EMAIL_RX.match(v["email"]):
+            messagebox.showerror(APP_NAME, "E-Mail-Adresse ist ungültig.", parent=self)
+            return
+        for k in ("name", "company", "street", "house", "addr2", "zip", "city", "email", "phone"):
+            setattr(self.o, k, v[k])
+        self.o.country = "DE"
+        self.weight, self.value, self.reference = w, value, v["ref"] or f"Retoure {self.o.ref}"
+        self.mail = self.mail_var.get()
         self.saved = True
         self.destroy()
 
@@ -4718,6 +4887,9 @@ class SettingsDialog(tk.Toplevel):
         self.track_pw = tk.StringVar(value=self.cfg.dhl_track_password)
         self._row(g, "Benutzer", self._var("dhl_track_user"), width=24, lw=12)
         self._row(g, "Passwort", self.track_pw, show="•", width=24, lw=12)
+        g = self._head(left, "Retoure", "Empfänger-ID aus dem Geschäftskundenportal (Retoure → Einstellungen → "
+                                        "Empfänger-ID), meist „deu“. Gilt für alle Arbeitsplätze.", top=14)
+        self._row(g, "Empfänger-ID", self._var("dhl_return_receiver", "deu"), width=24, lw=12)
         g = self._head(right, "Label", "910-300-400 = 100 × 150 mm für Etikettendrucker (Zebra), "
                                        "910-300-300 = A6 für Laserdrucker, „-oz“ = ohne Abziehcodes.")
         self.vars["dhl_print_format"] = tk.StringVar(value=self.cfg["dhl_print_format"] or "910-300-400")
@@ -5086,6 +5258,8 @@ class TrackingWindow(tk.Toplevel):
         self.btn_copy.pack(side="right", padx=(0, 6))
         self.btn_new = FlatButton(head, "Neue Sendung daraus…", self.new_from, "ghost")
         self.btn_new.pack(side="right", padx=(0, 6))
+        self.btn_return = FlatButton(head, "Retourenlabel…", self.return_from, "ghost")
+        self.btn_return.pack(side="right", padx=(0, 6))
         self.events = tk.Text(det, height=8, relief="flat", bd=0, bg=C["paper"], font=F["body"], padx=16,
                               wrap="word", cursor="arrow")
         self.events.pack(fill="x", pady=(0, 10))
@@ -5217,7 +5391,7 @@ class TrackingWindow(tk.Toplevel):
                 if ev["place"]:
                     t.insert("end", f"  ·  {ev['place']}", ("place",))
         t.configure(state="disabled")
-        for b in (self.btn_dhl, self.btn_copy, self.btn_new):
+        for b in (self.btn_dhl, self.btn_copy, self.btn_new, self.btn_return):
             b.state(["!disabled"] if num else ["disabled"])
 
     def open_dhl(self):
@@ -5244,10 +5418,12 @@ class TrackingWindow(tk.Toplevel):
         m.add_command(label="Sendungsnummer kopieren", command=self.copy_number)
         m.add_separator()
         m.add_command(label="Neue Sendung daraus…", command=self.new_from)
+        m.add_command(label="Retourenlabel erstellen…", command=self.return_from)
         m.tk_popup(e.x_root, e.y_root)
 
-    def new_from(self):
-        """Neue Sendung an denselben Empfänger (z. B. Nachlieferung) – Daten aus Liste, Ordner oder Speed4Trade."""
+    def new_from(self, action="new"):
+        """Neue Sendung an denselben Empfänger (z. B. Nachlieferung) oder Retourenlabel – Daten aus Liste, Ordner
+        oder Speed4Trade."""
         num = self._current()
         if not num:
             return
@@ -5263,9 +5439,17 @@ class TrackingWindow(tk.Toplevel):
         if template is None:
             messagebox.showinfo(APP_NAME, f"Zu Auftrag {a['ref']} wurden keine Empfängerdaten gefunden"
                                 + (f":\n\n{err}" if err else " (weder in der Liste noch in Speed4Trade).")
-                                + "\n\nBitte die Sendung über „Sendung erfassen…“ von Hand anlegen.", parent=self)
+                                + ("\n\nBitte die Sendung über „Sendung erfassen…“ von Hand anlegen."
+                                   if action == "new" else ""), parent=self)
             return
-        app.new_shipment(template, parent=self)
+        if action == "return":
+            app.create_return(template, parent=self)
+            self.reload()  # neue Retouren-Sendungsnummer in der Liste zeigen
+        else:
+            app.new_shipment(template, parent=self)
+
+    def return_from(self):
+        self.new_from("return")
 
 
 def selftest(path):
