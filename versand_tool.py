@@ -90,7 +90,8 @@ DEFAULTS = {
     "dhl_billing": "",         # 14-stellige Abrechnungsnummer DHL Paket (EKP + 01 + Teilnahme)
     "dhl_profile": "STANDARD_GRUPPENPROFIL",
     "dhl_print_format": "910-300-400",  # 100 × 150 mm, Thermodruck (Zebra), randlos
-    "dhl_return_receiver": "deu",  # Retouren-Empfänger-ID aus dem GKP (Retoure → Einstellungen)
+    "dhl_return_receiver": "",  # Retouren-Empfänger-ID aus dem GKP, gehört zur Retouren-Abrechnungsnummer
+    "dhl_return_billing": "",   # Abrechnungsnummer DHL Retoure (Verfahren 07), nur zum Abrufen der Empfänger-ID
     "dhl_track_user": "",      # GKP-Benutzer mit Recht „Sendungsverfolgung“ (leer = dhl_user), Passwort verschlüsselt
     "color_theme": "Standard",  # Farbschema (THEMES), pro PC
     "color_bar": "",           # eigene Leistenfarbe #RRGGBB (leer = aus dem Schema)
@@ -103,7 +104,7 @@ SHARED_SETTINGS = ("default_weight_kg", "shipping_option_de", "shipping_option_e
                    "sender_house_number", "sender_postal_code", "sender_city", "sender_country", "use_history",
                    "s4t_host", "s4t_cert_sha256", "s4t_tag", "s4t_status_id", "s4t_status_extra", "s4t_mandator", "s4t_report",
                    "carrier", "dhl_sandbox", "dhl_billing", "dhl_profile", "dhl_print_format",
-                   "dhl_return_receiver")
+                   "dhl_return_receiver", "dhl_return_billing")
 REQUIRED_SENDER = (("sender_company", "Absender Firma"), ("sender_street", "Absender Straße"),
                    ("sender_house_number", "Absender Hausnr."), ("sender_postal_code", "Absender PLZ"),
                    ("sender_city", "Absender Ort"), ("sender_country", "Absender Land"),
@@ -931,6 +932,28 @@ class DHL:
         if any((it.get("sstatus") or {}).get("status", 200) >= 400 for it in d.get("items") or []):
             raise DHLError(self._errors(d))
 
+    def return_receivers(self, billing=""):
+        """Retouren-Empfänger des Kontos: [(receiverId, Abrechnungsnummer, Beschreibung)]. Nur Empfänger mit
+        Abrechnungsnummer können Labels erzeugen."""
+        q = {"countryCode": "DEU", **({"billingNumber": billing} if billing else {})}
+        d = self._call("GET", "/locations?" + urllib.parse.urlencode(q), api=DHL_RETURNS_API)
+        found = []
+
+        def walk(x):
+            if isinstance(x, dict):
+                if x.get("receiverId"):
+                    a = x.get("address") if isinstance(x.get("address"), dict) else x
+                    desc = " ".join(str(a.get(k) or "") for k in ("name1", "name", "postalCode", "city")).strip()
+                    found.append((str(x["receiverId"]), str(x.get("billingNumber") or ""), desc))
+                for v in x.values():
+                    if isinstance(v, (dict, list)):
+                        walk(v)
+            elif isinstance(x, list):
+                for v in x:
+                    walk(v)
+        walk(d)
+        return found
+
     def create_return(self, o: Order, weight, value, reference):
         """Retourenlabel: der Kunde (o) ist Absender, Empfänger ist die Retouren-Empfänger-ID aus dem GKP.
         Rückgabe: (Sendungsnummer, Label-PDF, QR-Code-PNG oder None)."""
@@ -952,13 +975,23 @@ class DHL:
             shipper["email"] = o.email[:80]
         if o.phone:
             shipper["phone"] = o.phone[:20]
-        body = {"receiverId": "deu" if self.sandbox else (self.cfg["dhl_return_receiver"].strip() or "deu"),
+        receiver = "deu" if self.sandbox else self.cfg["dhl_return_receiver"].strip()
+        if not receiver:
+            raise DHLError("Die Retouren-Empfänger-ID fehlt – bitte unter Einstellungen → DHL → Retoure die "
+                           "Retouren-Abrechnungsnummer eintragen und „Empfänger-ID abrufen“ klicken")
+        body = {"receiverId": receiver,
                 "customerReference": reference[:30], "shipmentReference": reference[:30], "shipper": shipper,
                 "itemWeight": {"uom": "kg", "value": round(max(weight, 0.01), 3)},
                 "itemValue": {"currency": "EUR", "value": round(max(value, 0), 2)}}
         if not self.sandbox:  # wie beim Versand: der Vertrag verlangt GoGreen Plus
             body["services"] = {"goGreenPlus": True}
-        d = self._call("POST", "/orders?labelType=BOTH", body, api=DHL_RETURNS_API)
+        try:
+            d = self._call("POST", "/orders?labelType=BOTH", body, api=DHL_RETURNS_API)
+        except DHLError as e:
+            if "recipient" in str(e).lower() or "receiver" in str(e).lower():
+                raise DHLError(f"DHL kennt die Retouren-Empfänger-ID „{receiver}“ nicht ({e}). Bitte unter "
+                               "Einstellungen → DHL → Retoure „Empfänger-ID abrufen“ klicken")
+            raise
         if not d.get("shipmentNo") or not (d.get("label") or {}).get("b64"):
             raise DHLError(f"Keine Retouren-Sendungsnummer erhalten: {self._errors(d)}")
         qr = (d.get("qrLabel") or {}).get("b64")
@@ -4887,9 +4920,11 @@ class SettingsDialog(tk.Toplevel):
         self.track_pw = tk.StringVar(value=self.cfg.dhl_track_password)
         self._row(g, "Benutzer", self._var("dhl_track_user"), width=24, lw=12)
         self._row(g, "Passwort", self.track_pw, show="•", width=24, lw=12)
-        g = self._head(left, "Retoure", "Empfänger-ID aus dem Geschäftskundenportal (Retoure → Einstellungen → "
-                                        "Empfänger-ID), meist „deu“. Gilt für alle Arbeitsplätze.", top=14)
-        self._row(g, "Empfänger-ID", self._var("dhl_return_receiver", "deu"), width=24, lw=12)
+        g = self._head(left, "Retoure", "Abrechnungsnummer DHL Retoure (14-stellig, Verfahren 07) eintragen und "
+                                        "die zugehörige Empfänger-ID bei DHL abrufen. Gilt für alle Arbeitsplätze.",
+                       action=("Empfänger-ID abrufen", self.fetch_return_receiver), top=14)
+        self._row(g, "Abrechnungsnr.", self._var("dhl_return_billing"), width=24, lw=12)
+        self._row(g, "Empfänger-ID", self._var("dhl_return_receiver"), width=24, lw=12)
         g = self._head(right, "Label", "910-300-400 = 100 × 150 mm für Etikettendrucker (Zebra), "
                                        "910-300-300 = A6 für Laserdrucker, „-oz“ = ohne Abziehcodes.")
         self.vars["dhl_print_format"] = tk.StringVar(value=self.cfg["dhl_print_format"] or "910-300-400")
@@ -5077,6 +5112,44 @@ class SettingsDialog(tk.Toplevel):
             return "\n\nAchtung: Testumgebung aktiv." if tmp["dhl_sandbox"] == "1" else ""
         self._busy_test(run, "Verbindung zu DHL erfolgreich – Probe-Sendung an die eigene Adresse wurde geprüft "
                              "(nicht angelegt).")
+
+    def fetch_return_receiver(self):
+        tmp = self._scratch()
+        tmp["carrier"] = "dhl"
+        if tmp.carrier_missing:
+            messagebox.showerror(APP_NAME, "Es fehlt:\n\n• " + "\n• ".join(tmp.carrier_missing), parent=self)
+            return
+        billing = self.vars["dhl_return_billing"].get().strip().replace(" ", "")
+        self.configure(cursor="watch")
+        self.update()
+        try:
+            found = DHL(tmp).return_receivers(billing)
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"Empfänger-IDs konnten nicht abgerufen werden:\n\n{e}", parent=self)
+            return
+        finally:
+            self.configure(cursor="")
+        usable = [f for f in found if f[1]] or found
+        if billing:
+            usable = [f for f in usable if f[1].replace(" ", "") == billing] or usable
+        if not usable:
+            messagebox.showinfo(APP_NAME, "DHL meldet für dieses Konto keine Retouren-Empfänger"
+                                + (f" zur Abrechnungsnummer {billing}" if billing else "")
+                                + ". Bitte im Geschäftskundenportal unter Retoure prüfen.", parent=self)
+            return
+        if len(usable) == 1:
+            rid, bill, desc = usable[0]
+            self.vars["dhl_return_receiver"].set(rid)
+            if bill and not billing:
+                self.vars["dhl_return_billing"].set(bill)
+            messagebox.showinfo(APP_NAME, f"Empfänger-ID „{rid}“ übernommen"
+                                + (f" ({desc})" if desc else "") + ".\n\nZum Übernehmen „Speichern“ klicken.", parent=self)
+            return
+        lines = "\n".join(f"• {rid}" + (f"  –  Abrechnungsnr. {bill}" if bill else "") + (f"  –  {desc}" if desc else "")
+                          for rid, bill, desc in usable)
+        messagebox.showinfo(APP_NAME, "DHL meldet mehrere Retouren-Empfänger:\n\n" + lines +
+                            "\n\nBitte die passende Empfänger-ID eintragen (oder die Abrechnungsnummer angeben und "
+                            "erneut abrufen).", parent=self)
 
     def test_s4t(self):
         if not self._confirm_cert():
