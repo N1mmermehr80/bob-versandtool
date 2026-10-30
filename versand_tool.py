@@ -977,8 +977,8 @@ class DHL:
             shipper["phone"] = o.phone[:20]
         receiver = "deu" if self.sandbox else self.cfg["dhl_return_receiver"].strip()
         if not receiver:
-            raise DHLError("Die Retouren-Empfänger-ID fehlt – bitte unter Einstellungen → DHL → Retoure die "
-                           "Retouren-Abrechnungsnummer eintragen und „Empfänger-ID abrufen“ klicken")
+            raise DHLError("Die Retouren-Empfänger-ID fehlt – bitte unter Einstellungen → DHL die "
+                           "Retouren-Abrechnungsnummer eintragen und „Bei DHL abrufen“ klicken")
         body = {"receiverId": receiver,
                 "customerReference": reference[:30], "shipmentReference": reference[:30], "shipper": shipper,
                 "itemWeight": {"uom": "kg", "value": round(max(weight, 0.01), 3)},
@@ -990,7 +990,7 @@ class DHL:
         except DHLError as e:
             if "recipient" in str(e).lower() or "receiver" in str(e).lower():
                 raise DHLError(f"DHL kennt die Retouren-Empfänger-ID „{receiver}“ nicht ({e}). Bitte unter "
-                               "Einstellungen → DHL → Retoure „Empfänger-ID abrufen“ klicken")
+                               "Einstellungen → DHL „Bei DHL abrufen“ klicken")
             raise
         if not d.get("shipmentNo") or not (d.get("label") or {}).get("b64"):
             raise DHLError(f"Keine Retouren-Sendungsnummer erhalten: {self._errors(d)}")
@@ -4902,11 +4902,15 @@ class SettingsDialog(tk.Toplevel):
         self.dhl_key, self.dhl_secret, self.dhl_pw = (tk.StringVar(value=v) for v in
                                                       (self.cfg.dhl_api_key, self.cfg.dhl_api_secret,
                                                        self.cfg.dhl_password))
-        self._row(g, "API-Key", self.dhl_key)
+        self._row(g, "API-Key", self.dhl_key, show="•")
         self._row(g, "API-Secret (optional)", self.dhl_secret, show="•")
         self._row(g, "GKP-Benutzer", self._var("dhl_user"))
         self._row(g, "Passwort", self.dhl_pw, show="•")
         self._row(g, "Abrechnungsnummer", self._var("dhl_billing"), width=20)
+        # Retoure: eigene Abrechnungsnummer (Verfahren 07); DHL erwartet beim Label die zugehörige Empfänger-ID
+        self._row(g, "Retouren-Abrechnungsnr.", self._var("dhl_return_billing"), width=20, note="Verfahren 07")
+        e = self._row(g, "Retouren-Empfänger-ID", self._var("dhl_return_receiver"), width=20)
+        ttk.Button(e.master, text="Bei DHL abrufen", command=self.fetch_return_receiver).pack(side="left", padx=(10, 0))
         self._row(g, "Gruppenprofil", self._var("dhl_profile"))
         cols = ttk.Frame(pg, style="Card.TFrame")
         cols.pack(fill="x", pady=(6, 0))
@@ -4920,11 +4924,6 @@ class SettingsDialog(tk.Toplevel):
         self.track_pw = tk.StringVar(value=self.cfg.dhl_track_password)
         self._row(g, "Benutzer", self._var("dhl_track_user"), width=24, lw=12)
         self._row(g, "Passwort", self.track_pw, show="•", width=24, lw=12)
-        g = self._head(left, "Retoure", "Abrechnungsnummer DHL Retoure (14-stellig, Verfahren 07) eintragen und "
-                                        "die zugehörige Empfänger-ID bei DHL abrufen. Gilt für alle Arbeitsplätze.",
-                       action=("Empfänger-ID abrufen", self.fetch_return_receiver), top=14)
-        self._row(g, "Abrechnungsnr.", self._var("dhl_return_billing"), width=24, lw=12)
-        self._row(g, "Empfänger-ID", self._var("dhl_return_receiver"), width=24, lw=12)
         g = self._head(right, "Label", "910-300-400 = 100 × 150 mm für Etikettendrucker (Zebra), "
                                        "910-300-300 = A6 für Laserdrucker, „-oz“ = ohne Abziehcodes.")
         self.vars["dhl_print_format"] = tk.StringVar(value=self.cfg["dhl_print_format"] or "910-300-400")
