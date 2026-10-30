@@ -2131,30 +2131,79 @@ def append_log(o: Order, note):
         w.writerow([dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), o.ref, o.tracking, o.parcel_id, o.name, note])
 
 
-def return_mail(o: Order, number, files, cfg, folder):
-    from email.message import EmailMessage
-    m = EmailMessage()
-    m["To"] = o.email
-    m["Subject"] = f"Ihr Retourenlabel zu Auftrag {o.ref}"
-    m["X-Unsent"] = "1"
-    qr = len(files) > 1
-    m.set_content(
-        f"Guten Tag {o.name or o.company},\n\n"
-        f"anbei erhalten Sie das DHL-Retourenlabel für Ihre Rücksendung zu Auftrag {o.ref}.\n\n"
-        "Bitte drucken Sie das Label (PDF) aus und kleben Sie es gut sichtbar auf das Paket. "
-        + ("Ohne Drucker können Sie stattdessen den QR-Code (Bild im Anhang) in einer DHL-Filiale oder "
-           "Packstation vorzeigen – dort wird das Label für Sie gedruckt. " if qr else "")
-        + f"Die Rücksendung ist für Sie kostenlos.\n\nSendungsnummer der Rücksendung: {number}\n\n"
-        f"Mit freundlichen Grüßen\n{cfg['sender_name'] or ''}\n{cfg['sender_company'] or ''}".rstrip() + "\n")
-    for path in files:
-        with open(path, "rb") as f:
-            data = f.read()
-        kind = ("application", "pdf") if path.endswith(".pdf") else ("image", "png")
-        m.add_attachment(data, maintype=kind[0], subtype=kind[1], filename=os.path.basename(path))
-    path = os.path.join(folder, f"Retoure_{re.sub(r'[^A-Za-z0-9_-]', '', o.ref)}_{number}.eml")
-    with open(path, "wb") as f:
-        f.write(bytes(m))
-    return path
+def return_mail_text(o: Order, number, qr, cfg):
+    """Betreff und Text der Mail an den Kunden zum Retourenlabel."""
+    body = (f"Guten Tag {o.name or o.company},\n\n"
+            f"anbei erhalten Sie das DHL-Retourenlabel für Ihre Rücksendung zu Auftrag {o.ref}.\n\n"
+            "Bitte drucken Sie das Label (PDF) aus und kleben Sie es gut sichtbar auf das Paket. "
+            + ("Ohne Drucker können Sie stattdessen den QR-Code (Bild im Anhang) in einer DHL-Filiale oder "
+               "Packstation vorzeigen – dort wird das Label für Sie gedruckt. " if qr else "")
+            + f"Die Rücksendung ist für Sie kostenlos.\n\nSendungsnummer der Rücksendung: {number}\n\n"
+            f"Mit freundlichen Grüßen\n{cfg['sender_name'] or ''}\n{cfg['sender_company'] or ''}").rstrip() + "\n"
+    return f"Ihr Retourenlabel zu Auftrag {o.ref}", body
+
+
+def return_folder():
+    return os.path.join(BACKEND.root if BACKEND is not None else APP_DIR, "retouren")
+
+
+def return_files(number):
+    """Label-PDF (zuerst) und QR-Code einer Retoure aus dem Ordner „retouren“."""
+    try:
+        names = os.listdir(return_folder())
+    except OSError:
+        return []
+    pdf = [n for n in names if n.startswith("Retoure_") and n.endswith(f"_{number}.pdf")]
+    png = [n for n in names if n.startswith("Retoure_") and n.endswith(f"_{number}_QR.png")]
+    return [os.path.join(return_folder(), n) for n in pdf[:1] + png[:1]]
+
+
+# Neue Outlook-Mail per COM (wie „Senden an → E-Mail-Empfänger“). .eml-Dateien darf Outlook bei uns nicht öffnen.
+# Die Daten kommen als JSON-Datei, nie im Befehlstext – Kundennamen können Sonderzeichen enthalten.
+OUTLOOK_PS = r"""
+$ErrorActionPreference = 'Stop'
+$d = Get-Content -Raw -Encoding UTF8 -LiteralPath $env:BOB_MAIL_JSON | ConvertFrom-Json
+$ol = New-Object -ComObject Outlook.Application
+$m = $ol.CreateItem(0)
+$m.To = $d.to
+$m.Subject = $d.subject
+$m.Body = $d.body
+foreach ($f in $d.files) { [void]$m.Attachments.Add([string]$f) }
+if ($d.display) { $m.Display($false) } else { $m.Close(1) }
+"""
+
+
+def outlook_draft(to, subject, body, files, display=True):
+    """Outlook-Entwurf mit Anhängen öffnen. Wirft OSError, wenn Outlook nicht per COM erreichbar ist."""
+    import subprocess
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+        json.dump({"to": to, "subject": subject, "body": body, "files": files, "display": display}, f)
+    try:
+        cmd = ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+               base64.b64encode(OUTLOOK_PS.encode("utf-16-le")).decode()]
+        r = subprocess.run(cmd, env={**os.environ, "BOB_MAIL_JSON": f.name}, capture_output=True, timeout=90,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise OSError(f"Outlook nicht erreichbar: {e}")
+    finally:
+        try:
+            os.remove(f.name)
+        except OSError:
+            pass
+    if r.returncode:
+        msg = r.stderr.decode("utf-8", "replace").strip().splitlines()
+        raise OSError(msg[0] if msg else f"Outlook-Aufruf fehlgeschlagen ({r.returncode})")
+
+
+def mail_fallback(to, subject, body, files):
+    """Ohne Outlook-Steuerung: neue Mail mit Text (Standard-Mailprogramm) und Ordner mit dem Label öffnen –
+    die Anhänge lassen sich per Ziehen in die Mail übernehmen."""
+    import subprocess
+    os.startfile("mailto:" + urllib.parse.quote(to, safe="@") + "?" +
+                 urllib.parse.urlencode({"subject": subject, "body": body.replace("\n", "\r\n")},
+                                        quote_via=urllib.parse.quote))
+    subprocess.Popen(["explorer", "/select,", os.path.normpath(files[0])])
 
 
 # --------------------------------------------------------------------------- Oberfläche
@@ -3144,7 +3193,7 @@ class App(tk.Tk):
             return
         finally:
             parent.configure(cursor="")
-        folder = os.path.join(BACKEND.root if BACKEND is not None else APP_DIR, "retouren")
+        folder = return_folder()
         os.makedirs(folder, exist_ok=True)
         base = os.path.join(folder, f"Retoure_{re.sub(r'[^A-Za-z0-9_-]', '', o.ref)}_{number}")
         files = [base + ".pdf"] + ([base + "_QR.png"] if qr else [])
@@ -3154,13 +3203,31 @@ class App(tk.Tk):
         o.tracking, o.parcel_id = number, DHL_RETURN_PREFIX + number
         append_log(o, "Retourenlabel erstellt" + (" (Testumgebung)" if dhl.sandbox else ""))
         if dlg.mail and o.email:
-            try:
-                os.startfile(return_mail(o, number, files, self.cfg, folder))
-                return
-            except OSError as e:
-                messagebox.showwarning(APP_NAME, f"E-Mail-Entwurf konnte nicht geöffnet werden:\n{e}\n\n"
-                                                 "Das Label wird stattdessen geöffnet.", parent=parent)
-        os.startfile(files[0])
+            self.mail_return(o, number, files, parent)
+        else:
+            os.startfile(files[0])
+
+    def mail_return(self, o, number, files, parent):
+        """Entwurf an den Kunden mit Label und QR-Code: Outlook direkt, sonst neue Mail + Ordner zum Hineinziehen."""
+        subject, body = return_mail_text(o, number, len(files) > 1, self.cfg)
+        parent.configure(cursor="watch")
+        parent.update()
+        try:
+            outlook_draft(o.email, subject, body, files)
+            return
+        except OSError as e:
+            err = str(e)
+        finally:
+            parent.configure(cursor="")
+        try:
+            mail_fallback(o.email, subject, body, files)
+            messagebox.showinfo(APP_NAME, "Outlook ließ sich nicht direkt ansteuern"
+                                f" ({err[:200]}).\n\nEs wurde eine neue Mail mit dem Text geöffnet und der Ordner "
+                                "mit dem Label – bitte Label (und QR-Code) in die Mail ziehen.", parent=parent)
+        except OSError as e:
+            messagebox.showwarning(APP_NAME, f"E-Mail konnte nicht geöffnet werden:\n{err}\n{e}\n\n"
+                                             "Das Label wird stattdessen geöffnet.", parent=parent)
+            os.startfile(files[0])
 
     def archived_order(self, ref):
         """Früheren Auftrag für „Neue Sendung daraus“ finden: aktuelle Liste, gemeinsamer Ordner (erledigte
@@ -5509,7 +5576,49 @@ class TrackingWindow(tk.Toplevel):
         m.add_separator()
         m.add_command(label="Neue Sendung daraus…", command=self.new_from)
         m.add_command(label="Retourenlabel erstellen…", command=self.return_from)
+        if self.archive[iid]["via"] == "Retoure":
+            m.add_separator()
+            m.add_command(label="Retourenlabel öffnen", command=self.open_return)
+            m.add_command(label="Retouren-Mail an den Kunden erstellen…", command=self.mail_return)
+            m.add_command(label="Ordner „retouren“ öffnen", command=lambda: os.startfile(return_folder()))
         m.tk_popup(e.x_root, e.y_root)
+
+    def _return_files(self):
+        num = self._current()
+        files = return_files(num) if num else []
+        if num and not files:
+            messagebox.showinfo(APP_NAME, f"Zur Retoure {num} liegt kein Label im Ordner „retouren“.", parent=self)
+        return num, files
+
+    def open_return(self):
+        num, files = self._return_files()
+        if files:
+            os.startfile(files[0])
+
+    def mail_return(self):
+        """Mail zur Retoure (erneut) erstellen, z. B. wenn der Entwurf beim Anlegen nicht geöffnet werden konnte."""
+        num, files = self._return_files()
+        if not files:
+            return
+        ref, app = self.archive[num]["ref"], self.master
+        self.configure(cursor="watch")
+        self.update()
+        try:
+            o = app.archived_order(ref)
+        except Exception:
+            o = None
+        finally:
+            self.configure(cursor="")
+        if o is None:
+            o = Order(ref)
+            o.name = self.archive[num]["name"]
+        if not o.email:
+            from tkinter import simpledialog
+            o.email = (simpledialog.askstring(APP_NAME, f"E-Mail-Adresse des Kunden zu Auftrag {ref}:",
+                                              parent=self) or "").strip()
+            if not o.email:
+                return
+        app.mail_return(o, num, files, self)
 
     def new_from(self, action="new"):
         """Neue Sendung an denselben Empfänger (z. B. Nachlieferung) oder Retourenlabel – Daten aus Liste, Ordner
