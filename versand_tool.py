@@ -5426,7 +5426,8 @@ class TrackingWindow(tk.Toplevel):
         self.tree.bind("<Button-3>", self._context_menu)
 
         det = tk.Frame(self, bg=C["paper"], highlightthickness=1, highlightbackground=C["line"])
-        det.pack(fill="x", padx=14, pady=12)
+        # vor der Liste packen: bei kleinem Fenster (Skalierung) schrumpft die Liste, nicht der Detailbereich
+        det.pack(side="bottom", fill="x", padx=14, pady=12, before=frm)
         # Aktionen rechts untereinander, gleich breit, im Stil der Kopfleiste (Graphit) – Text wird nie abgeschnitten
         acts = tk.Frame(det, bg=C["paper"], padx=14, pady=12)
         acts.pack(side="right", fill="y")
