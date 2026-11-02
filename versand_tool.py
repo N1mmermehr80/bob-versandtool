@@ -1192,14 +1192,37 @@ def tracking_archive(days):
                 continue
             via = "Retoure" if row[3].startswith(DHL_RETURN_PREFIX) else "DHL direkt" \
                 if row[3].startswith(DHL_PREFIX) else "Sendcloud" if row[3].strip() else "manuell"
-            for num in re.split(r"[,;\s]+", row[2]):
-                if not num:
-                    continue
+            nums = [n for n in re.split(r"[,;\s]+", row[2]) if n]
+            pids = [p for p in re.split(r"[,;\s]+", row[3]) if p]
+            for k, num in enumerate(nums):
                 cur = out.get(num)
+                pid = pids[k] if len(pids) == len(nums) else ""  # Paket-ID zur Nummer, nur bei eindeutiger Zuordnung
                 if cur is None or sent < cur["sent"]:
                     out[num] = {"sent": sent, "ref": row[1], "name": row[4] or (cur or {}).get("name", ""),
-                                "via": via if via != "manuell" or cur is None else cur["via"]}
+                                "via": via if via != "manuell" or cur is None else cur["via"],
+                                "pid": pid or (cur or {}).get("pid", "")}
+                elif pid and not cur.get("pid"):
+                    cur["pid"] = pid
     return out
+
+
+def find_label(number, cfg):
+    """Gespeichertes Label-PDF zu einer Sendungsnummer: Retourenordner, Labelordner des Programms, PDF-Ablage."""
+    hits = [p for p in return_files(number) if p.endswith(".pdf")]
+    if hits:
+        return hits[0]
+    tail = re.sub(r"[^\w.-]", "_", f"_{number}.pdf")
+    for folder in (LABEL_DIR, cfg["label_dir"] if cfg["save_label_pdf"] == "1" else ""):
+        if not folder:
+            continue
+        try:
+            with os.scandir(folder) as it:
+                for e in it:
+                    if e.name.endswith(tail):
+                        return e.path
+        except OSError:
+            pass
+    return None
 
 
 def tracking_state(info, sent):
@@ -5417,6 +5440,8 @@ class TrackingWindow(tk.Toplevel):
         self.btn_new.pack(side="right", padx=(0, 6))
         self.btn_return = FlatButton(head, "Retourenlabel…", self.return_from, "ghost")
         self.btn_return.pack(side="right", padx=(0, 6))
+        self.btn_reprint = FlatButton(head, "Label nachdrucken", self.reprint, "ghost")
+        self.btn_reprint.pack(side="right", padx=(0, 6))
         self.events = tk.Text(det, height=8, relief="flat", bd=0, bg=C["paper"], font=F["body"], padx=16,
                               wrap="word", cursor="arrow")
         self.events.pack(fill="x", pady=(0, 10))
@@ -5426,6 +5451,7 @@ class TrackingWindow(tk.Toplevel):
         self.events.configure(state="disabled")
 
         self.bind("<Escape>", lambda ev: self.destroy())
+        self.bind("<Control-p>", lambda ev: self.reprint())
         center_over(self, master, (1180, 720))
         self.after(100, self._poll)
         self.reload()
@@ -5548,7 +5574,7 @@ class TrackingWindow(tk.Toplevel):
                 if ev["place"]:
                     t.insert("end", f"  ·  {ev['place']}", ("place",))
         t.configure(state="disabled")
-        for b in (self.btn_dhl, self.btn_copy, self.btn_new, self.btn_return):
+        for b in (self.btn_dhl, self.btn_copy, self.btn_new, self.btn_return, self.btn_reprint):
             b.state(["!disabled"] if num else ["disabled"])
 
     def open_dhl(self):
@@ -5573,12 +5599,13 @@ class TrackingWindow(tk.Toplevel):
         m = tk.Menu(self, tearoff=0)
         m.add_command(label="Bei DHL öffnen", command=self.open_dhl)
         m.add_command(label="Sendungsnummer kopieren", command=self.copy_number)
+        m.add_command(label="Label nachdrucken (Strg+P)", command=self.reprint)
+        m.add_command(label="Label öffnen", command=lambda: self.reprint(open_only=True))
         m.add_separator()
         m.add_command(label="Neue Sendung daraus…", command=self.new_from)
         m.add_command(label="Retourenlabel erstellen…", command=self.return_from)
         if self.archive[iid]["via"] == "Retoure":
             m.add_separator()
-            m.add_command(label="Retourenlabel öffnen", command=self.open_return)
             m.add_command(label="Retouren-Mail an den Kunden erstellen…", command=self.mail_return)
             m.add_command(label="Ordner „retouren“ öffnen", command=lambda: os.startfile(return_folder()))
         m.tk_popup(e.x_root, e.y_root)
@@ -5590,10 +5617,59 @@ class TrackingWindow(tk.Toplevel):
             messagebox.showinfo(APP_NAME, f"Zur Retoure {num} liegt kein Label im Ordner „retouren“.", parent=self)
         return num, files
 
-    def open_return(self):
-        num, files = self._return_files()
-        if files:
-            os.startfile(files[0])
+    def _label_for(self, num):
+        """Label-PDF zur Sendung: gespeicherte Datei, sonst bei Sendcloud bzw. DHL (bis Tagesabschluss) nachladen."""
+        path = find_label(num, self.cfg)
+        if path:
+            return path
+        a = self.archive[num]
+        pid = a.get("pid", "")
+        if a["via"] == "Retoure" or not pid or not (pid.isdigit() or pid.startswith(DHL_PREFIX)):
+            raise RuntimeError(f"Zur Sendung {num} ist kein Label gespeichert"
+                               + (" (Retourenlabel nicht im Ordner „retouren“)." if a["via"] == "Retoure" else
+                                  " und es kann nicht nachgeladen werden (keine Paket-ID im Protokoll)."))
+        o = Order(a["ref"])
+        store_label(o, num, label_client(self.cfg, pid).label_pdf(pid), self.cfg)
+        return os.path.join(LABEL_DIR, o.labels[0])
+
+    def reprint(self, open_only=False):
+        num = self._current()
+        if not num:
+            return
+        self.configure(cursor="watch")
+        self.update()
+        try:
+            path = self._label_for(num)
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"Label nicht gefunden:\n\n{e}", parent=self)
+            return
+        finally:
+            self.configure(cursor="")
+        if open_only:
+            os.startfile(path)
+            return
+        retoure = self.archive[num]["via"] == "Retoure"
+        key = "printer_a4" if retoure else "printer_a6"  # Retourenlabel meist auf Papier, Versandlabel auf Etikett
+        try:
+            pdf = open(path, "rb").read()
+            if not retoure:
+                try:
+                    pdf = to_a6(pdf)  # auch ältere, nicht umgerechnete Labels
+                except Exception:
+                    pass
+            printed = print_pdf(pdf, int(self.wm_frame(), 16), self.cfg[key],
+                                ask=retoure or self.cfg["print_direct"] != "1", title=os.path.basename(path))
+            self.cfg[key] = printed
+            self.cfg.save()
+            self.info_label.configure(text=f"Label {num} an {printed} gesendet")
+        except PrintCancelled:
+            self.info_label.configure(text="Nachdruck abgebrochen")
+        except ImportError:
+            os.startfile(path)  # Druckmodul fehlt (Entwicklungsumgebung)
+        except Exception as e:
+            if messagebox.askyesno(APP_NAME, f"Drucken fehlgeschlagen:\n{e}\n\nStattdessen das PDF öffnen?",
+                                   parent=self):
+                os.startfile(path)
 
     def mail_return(self):
         """Mail zur Retoure (erneut) erstellen, z. B. wenn der Entwurf beim Anlegen nicht geöffnet werden konnte."""
