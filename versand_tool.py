@@ -2161,8 +2161,7 @@ def return_mail_text(o: Order, number, qr, cfg):
             "Bitte drucken Sie das Label (PDF) aus und kleben Sie es gut sichtbar auf das Paket. "
             + ("Ohne Drucker können Sie stattdessen den QR-Code (Bild im Anhang) in einer DHL-Filiale oder "
                "Packstation vorzeigen – dort wird das Label für Sie gedruckt. " if qr else "")
-            + f"Die Rücksendung ist für Sie kostenlos.\n\nSendungsnummer der Rücksendung: {number}\n\n"
-            f"Mit freundlichen Grüßen\n{cfg['sender_name'] or ''}\n{cfg['sender_company'] or ''}").rstrip() + "\n"
+            + f"Die Rücksendung ist für Sie kostenlos.\n\nSendungsnummer der Rücksendung: {number}\n\n")
     return f"Ihr Retourenlabel zu Auftrag {o.ref}", body
 
 
@@ -5428,23 +5427,29 @@ class TrackingWindow(tk.Toplevel):
 
         det = tk.Frame(self, bg=C["paper"], highlightthickness=1, highlightbackground=C["line"])
         det.pack(fill="x", padx=14, pady=12)
-        head = tk.Frame(det, bg=C["paper"], padx=16, pady=10)
+        # Aktionen rechts untereinander, gleich breit, im Stil der Kopfleiste (Graphit) – Text wird nie abgeschnitten
+        acts = tk.Frame(det, bg=C["paper"], padx=14, pady=12)
+        acts.pack(side="right", fill="y")
+        tk.Frame(det, bg=C["line"], width=1).pack(side="right", fill="y", pady=12)
+        self.btn_reprint = FlatButton(acts, "Label nachdrucken", self.reprint, "bar")
+        self.btn_dhl = FlatButton(acts, "Bei DHL öffnen ↗", self.open_dhl, "bar")
+        self.btn_copy = FlatButton(acts, "Nummer kopieren", self.copy_number, "bar")
+        self.btn_new = FlatButton(acts, "Neue Sendung daraus…", self.new_from, "bar")
+        self.btn_return = FlatButton(acts, "Retourenlabel…", self.return_from, "bar")
+        for k, b in enumerate((self.btn_reprint, self.btn_dhl, self.btn_copy, self.btn_new, self.btn_return)):
+            b.configure(anchor="w")
+            b.pack(fill="x", pady=(0 if k == 0 else 6, 0))
+        body = tk.Frame(det, bg=C["paper"])
+        body.pack(side="left", fill="both", expand=True)
+        head = tk.Frame(body, bg=C["paper"], padx=16, pady=10)
         head.pack(fill="x")
-        self.det_title = tk.Label(head, text="Sendungsverlauf", bg=C["paper"], fg=C["ink"], font=F["section"])
-        self.det_title.pack(side="left")
-        self.btn_dhl = FlatButton(head, "Bei DHL öffnen ↗", self.open_dhl, "ghost")
-        self.btn_dhl.pack(side="right")
-        self.btn_copy = FlatButton(head, "Nummer kopieren", self.copy_number, "ghost")
-        self.btn_copy.pack(side="right", padx=(0, 6))
-        self.btn_new = FlatButton(head, "Neue Sendung daraus…", self.new_from, "ghost")
-        self.btn_new.pack(side="right", padx=(0, 6))
-        self.btn_return = FlatButton(head, "Retourenlabel…", self.return_from, "ghost")
-        self.btn_return.pack(side="right", padx=(0, 6))
-        self.btn_reprint = FlatButton(head, "Label nachdrucken", self.reprint, "ghost")
-        self.btn_reprint.pack(side="right", padx=(0, 6))
-        self.events = tk.Text(det, height=8, relief="flat", bd=0, bg=C["paper"], font=F["body"], padx=16,
+        self.det_title = tk.Label(head, text="Sendungsverlauf", bg=C["paper"], fg=C["ink"], font=F["section"],
+                                  anchor="w", justify="left")
+        self.det_title.pack(side="left", fill="x", expand=True)
+        head.bind("<Configure>", lambda e: self.det_title.configure(wraplength=max(200, e.width - 32)))
+        self.events = tk.Text(body, height=9, relief="flat", bd=0, bg=C["paper"], font=F["body"], padx=16,
                               wrap="word", cursor="arrow")
-        self.events.pack(fill="x", pady=(0, 10))
+        self.events.pack(fill="both", expand=True, pady=(0, 10))
         self.events.tag_configure("time", foreground=C["muted"], font=F["mono"])
         self.events.tag_configure("place", foreground=C["muted"])
         self.events.tag_configure("muted", foreground=C["muted"])
