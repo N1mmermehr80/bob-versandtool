@@ -2241,6 +2241,12 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"{APP_NAME} {APP_VERSION}")
+        # Programmicon (Karton, CC0) – default= gilt auch für alle Unterfenster und Dialoge
+        try:
+            base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+            self.iconbitmap(default=os.path.join(base, "app.ico"))
+        except Exception:
+            pass
         cleanup_old_update()
         self.geometry("1500x760")
         self.minsize(1000, 500)

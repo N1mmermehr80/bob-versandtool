@@ -34,7 +34,7 @@ jobs:
 
       # Ordner-Variante (startet ohne Entpacken) als ZIP: exe + _internal liegen direkt im Archiv
       - name: Ordner-Variante bauen
-        run: python -m PyInstaller --noconfirm --clean --onedir --windowed --hidden-import pypdf --collect-all pypdfium2 --collect-all pypdfium2_raw --distpath dist_ordner --workpath build_ordner --name "BOB-Sendcloud-Versand" versand_tool.py
+        run: python -m PyInstaller --noconfirm --clean --onedir --windowed --icon app.ico --add-data "app.ico;." --hidden-import pypdf --collect-all pypdfium2 --collect-all pypdfium2_raw --distpath dist_ordner --workpath build_ordner --name "BOB-Sendcloud-Versand" versand_tool.py
 
       - name: ZIP packen
         shell: pwsh
@@ -44,7 +44,7 @@ jobs:
 
       # Übergangsweise zusätzlich die einzelne exe: Versionen bis 1.0.6 kennen nur diese und stellen danach um
       - name: Einzel-exe bauen
-        run: python -m PyInstaller --noconfirm --onefile --windowed --hidden-import pypdf --collect-all pypdfium2 --collect-all pypdfium2_raw --name "BOB-Sendcloud-Versand" versand_tool.py
+        run: python -m PyInstaller --noconfirm --onefile --windowed --icon app.ico --add-data "app.ico;." --hidden-import pypdf --collect-all pypdfium2 --collect-all pypdfium2_raw --name "BOB-Sendcloud-Versand" versand_tool.py
 
       # Prüfung: die Ordner-Variante muss die Python-DLL enthalten, sonst startet sie nicht
       - name: Paket prüfen
