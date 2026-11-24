@@ -97,6 +97,19 @@ Ohne Server und ohne Adminrechte: Die Liste liegt in einem **Netzwerkordner**, a
 
 **Netzlaufwerk:** Auf Netzlaufwerken (z. B. `U:\…`) dauert jedes Öffnen einer Datei spürbar (~0,3 s). Das Tool liest deshalb parallel und beim Abgleich nur geänderte Dateien. Bekannte Aufträge werden beim Abholen gar nicht erst in den Ordner geschrieben.
 
+## Gemeinsame Datenbank (statt Netzwerkordner)
+
+Alternativ zum Netzwerkordner kann die gemeinsame Liste in der Datenbank `bob-db.fix-das.de` (Supabase) liegen. Dann braucht kein PC ein Netzlaufwerk.
+
+**Einrichten** (an jedem PC einmal): **Einstellungen → Arbeitsplätze → Datenbank** wählen, **Mit Microsoft anmelden** (der Browser öffnet sich), speichern. Das Tool startet neu. Unten links steht „Gemeinsame Liste (Datenbank) · angemeldet als <Name>“.
+
+- **Zugang:** nur Microsoft-Konten, die ein Administrator in der Tabelle `versand_benutzer` freigeschaltet hat. Die Anmeldung bleibt gespeichert (verschlüsselt für den Windows-Benutzer).
+- **Gleiches Verhalten wie im Ordner:** Reservierung beim Senden (keine doppelten Labels), Konflikterkennung bei gleichzeitigen Änderungen, Abgleich alle 4 Sekunden.
+- **In der Datenbank:** Aufträge, erledigte/gelöschte Aufträge (Archiv), gemeinsame Einstellungen, Protokoll. Labels, Retouren, Gewichts-Erfahrungswerte und die Sendungsverfolgung liegen als Dateien in der Datenbank-Ablage und werden lokal unter `%APPDATA%\BOB-Sendcloud-Versand\datenbank\` gespiegelt.
+- **Umstieg vom Netzwerkordner:** Im selben Reiter den bisherigen Ordner eintragen und **Netzwerkordner in die Datenbank übernehmen…** klicken. Kopiert Aufträge, Archiv, Einstellungen, Protokoll, Labels, Retouren und Gewichte. Mehrfaches Ausführen ist unschädlich, Vorhandenes wird nicht überschrieben. Der Ordner bleibt unverändert und kann als Rückweg weiter gewählt werden.
+- **Server nicht erreichbar:** wie beim Ordner roter Hinweis unten, Änderungen werden nachgereicht.
+- **Datenbankschema:** `supabase/versand.sql` (wiederholt ausführbar).
+
 ## Automatische Korrekturen
 
 - Land steht im Export in `STATE CODE` → wird nach `COUNTRY CODE` übernommen.

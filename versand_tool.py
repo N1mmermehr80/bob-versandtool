@@ -67,6 +67,9 @@ DEFAULTS = {
     "sender_country": "DE",
     "use_history": "1",
     "shared_dir": "",
+    "storage_mode": "",          # local | folder | db (leer: aus shared_dir abgeleitet)
+    "db_url": "",                # leer = DB_URL
+    "db_anon_key": "",           # leer = DB_ANON_KEY
     "update_repo": "",
     "label_paper": "A6",
     "print_direct": "0",
@@ -1167,6 +1170,11 @@ def tracking_archive(days):
     """Alle Sendungsnummern aus dem Versandprotokoll (gemeinsamer Ordner und lokal) der letzten `days` Tage:
     {Sendungsnummer: {"sent", "ref", "name", "via"}} – mehrere Zeilen je Nummer werden zusammengefasst."""
     paths = [LOG_PATH]
+    if is_db():
+        try:
+            BACKEND.refresh_protokoll()
+        except OSError:
+            pass
     if BACKEND is not None:
         try:
             with os.scandir(BACKEND.dirs["protokoll"]) as it:
@@ -1212,6 +1220,11 @@ def find_label(number, cfg):
     if hits:
         return hits[0]
     tail = re.sub(r"[^\w.-]", "_", f"_{number}.pdf")
+    if is_db():
+        try:
+            BACKEND.pull("labels", tail)
+        except OSError:
+            pass
     for folder in (LABEL_DIR, cfg["label_dir"] if cfg["save_label_pdf"] == "1" else ""):
         if not folder:
             continue
@@ -1254,6 +1267,11 @@ class TrackingStore:
         self.path = os.path.join(BACKEND.root if BACKEND is not None else APP_DIR, TRACK_FILE)
 
     def load(self):
+        if is_db():
+            try:
+                BACKEND.pull_data(TRACK_FILE)
+            except OSError:
+                pass
         try:
             with open(self.path, encoding="utf-8") as f:
                 return json.load(f)
@@ -1273,6 +1291,11 @@ class TrackingStore:
         for attempt in range(20):
             try:
                 os.replace(tmp, self.path)
+                if is_db():
+                    try:
+                        BACKEND.push_data(TRACK_FILE)
+                    except OSError:
+                        pass
                 return data
             except PermissionError:
                 time.sleep(0.1)
@@ -1681,6 +1704,11 @@ def store_label(o: Order, tracking, pdf: bytes, cfg):
         f.write(pdf)
     if fn not in o.labels:
         o.labels.append(fn)
+    if is_db():
+        try:
+            BACKEND.upload("labels", fn, pdf)
+        except OSError as e:  # wird beim nächsten Dateiabgleich nachgereicht
+            o.hints.append(f"Label noch nicht in der Datenbank (wird nachgereicht): {e}")
     if cfg["save_label_pdf"] == "1" and cfg["label_dir"]:
         try:
             os.makedirs(cfg["label_dir"], exist_ok=True)
@@ -1943,6 +1971,476 @@ class FolderBackend:
             w.writerow(row[:1] + [self.user] + row[1:])
 
 
+# --------------------------------------------------------------------------- Gemeinsame Datenbank (Supabase)
+
+DB_URL = "https://bob-db.fix-das.de"
+# Öffentlicher Schlüssel (anon) – darf im Programm stehen, Zugriff regeln Anmeldung und Datenbankregeln.
+DB_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzk1NTEzNzY5LCJleHAiOjE5NTMxOTM3Njl9.tZw3GbpCGzcy8mC9qnDxOG8Kk-PRcoU00pEOZLEky38"
+DB_LOGIN_PORT = 53683                           # Rücksprung nach der Microsoft-Anmeldung (in Supabase erlaubt)
+DB_DIR = os.path.join(APP_DIR, "datenbank")     # lokale Kopie von Labels, Retouren, Gewichten, Protokoll
+DB_BUCKET = "versand"
+DB_FILE_KINDS = ("labels", "retouren", "gewichte")
+DB_FILE_INTERVAL = 60                           # Dateien höchstens jede Minute abgleichen
+
+
+def storage_mode(cfg):
+    """'local', 'folder' oder 'db' – ältere Einstellungen kennen nur den gemeinsamen Ordner."""
+    m = cfg["storage_mode"].strip()
+    if m in ("local", "folder", "db"):
+        return m
+    return "folder" if cfg["shared_dir"].strip() else "local"
+
+
+class DbError(OSError):
+    def __init__(self, msg, status=0, code="", details=None):
+        super().__init__(msg)
+        self.status, self.code, self.details = status, code, details
+
+
+class DbAuthError(DbError):
+    """Anmeldung fehlt/abgelaufen oder Konto nicht freigeschaltet."""
+
+
+def _b64url(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+
+class DbClient:
+    """Zugriff auf Supabase über HTTPS (nur Standardbibliothek). Anmeldung mit Microsoft über den Browser
+    (PKCE), danach bleibt man über das Refresh-Token angemeldet (DPAPI-verschlüsselt in config.ini)."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.url = (cfg["db_url"].strip() or DB_URL).rstrip("/")
+        self.anon = cfg["db_anon_key"].strip() or DB_ANON_KEY
+        self._lock = threading.Lock()
+        self._access, self._exp = "", 0.0
+        self.email = ""
+
+    # ----- Anmeldung
+    @property
+    def refresh_token(self):
+        return unprotect(self.cfg.cp["settings"].get("db_refresh_enc", ""))
+
+    def _keep(self, session):
+        self._access = session["access_token"]
+        self._exp = time.time() + int(session.get("expires_in") or 3600)
+        self.email = (session.get("user") or {}).get("email", "") or self.email
+        self.cfg.cp["settings"]["db_refresh_enc"] = protect(session["refresh_token"])
+        self.cfg.save()
+
+    def logout(self):
+        with self._lock:
+            self._access, self._exp = "", 0.0
+            self.cfg.cp["settings"]["db_refresh_enc"] = ""
+            self.cfg.save()
+
+    def _auth_post(self, path, body):
+        req = urllib.request.Request(self.url + path, data=json.dumps(body).encode(), method="POST",
+                                     headers={"apikey": self.anon, "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            try:
+                j = json.loads(e.read())
+            except ValueError:
+                j = {}
+            msg = j.get("error_description") or j.get("msg") or j.get("message") or f"HTTP {e.code}"
+            raise DbAuthError(f"Anmeldung fehlgeschlagen: {msg}", e.code) from None
+
+    def login(self, timeout=300, cancel=None):
+        """Browser öffnen, Microsoft-Anmeldung abwarten (lokaler Rücksprung auf Port DB_LOGIN_PORT)."""
+        import http.server
+        import html
+        import secrets
+        import webbrowser
+        verifier = _b64url(secrets.token_bytes(48))
+        challenge = _b64url(hashlib.sha256(verifier.encode()).digest())
+        back = f"http://127.0.0.1:{DB_LOGIN_PORT}/"
+        result = {}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                q = {k: v[0] for k, v in urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).items()}
+                if "code" in q or "error" in q:
+                    result.update(q)
+                    if "code" in q:
+                        body = "<h2>Anmeldung erfolgreich</h2><p>Dieses Fenster kann geschlossen werden.</p>"
+                    else:
+                        body = ("<h2>Anmeldung fehlgeschlagen</h2><p>"
+                                + html.escape(q.get("error_description") or q.get("error", "")) + "</p>")
+                else:  # Fehler kommen teils im Fragment (#error=…) – an den Server weiterreichen
+                    body = ("<p>Einen Moment…</p><script>if(location.hash.length>1)"
+                            "location.replace('/?'+location.hash.substring(1));</script>")
+                page = ("<!doctype html><meta charset='utf-8'><title>Versandtool</title>"
+                        "<body style='font-family:Segoe UI,sans-serif;margin:3em'>" + body).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(page)))
+                self.end_headers()
+                self.wfile.write(page)
+
+            def log_message(self, *a):
+                pass
+        try:
+            srv = http.server.HTTPServer(("127.0.0.1", DB_LOGIN_PORT), Handler)
+        except OSError as e:
+            raise DbAuthError(f"Port {DB_LOGIN_PORT} ist belegt – läuft die Anmeldung schon in einem anderen "
+                              f"Fenster? ({e})") from None
+        srv.timeout = 0.5
+        url = (f"{self.url}/auth/v1/authorize?" + urllib.parse.urlencode(
+            {"provider": "azure", "redirect_to": back, "code_challenge": challenge,
+             "code_challenge_method": "s256", "scopes": "email"}))
+        try:
+            webbrowser.open(url)
+            deadline = time.time() + timeout
+            while not result and time.time() < deadline and not (cancel and cancel()):
+                srv.handle_request()
+        finally:
+            srv.server_close()
+        if "code" not in result:
+            raise DbAuthError("Anmeldung nicht abgeschlossen: " + (result.get("error_description")
+                                                                   or result.get("error") or "Zeit abgelaufen"))
+        session = self._auth_post("/auth/v1/token?grant_type=pkce",
+                                  {"auth_code": result["code"], "code_verifier": verifier})
+        with self._lock:
+            self._keep(session)
+        return session
+
+    def token(self):
+        with self._lock:
+            if self._access and time.time() < self._exp - 60:
+                return self._access
+            rt = self.refresh_token
+            if not rt:
+                raise DbAuthError("Nicht angemeldet – bitte unter Einstellungen → Arbeitsplätze anmelden.")
+            try:
+                session = self._auth_post("/auth/v1/token?grant_type=refresh_token", {"refresh_token": rt})
+            except DbAuthError as e:
+                if e.status in (400, 401, 403):  # Token ungültig/widerrufen → neu anmelden
+                    self.cfg.cp["settings"]["db_refresh_enc"] = ""
+                    self.cfg.save()
+                    raise DbAuthError("Anmeldung abgelaufen – bitte neu mit Microsoft anmelden.", e.status) from None
+                raise
+            self._keep(session)
+            return self._access
+
+    # ----- Anfragen
+    def request(self, method, path, body=None, headers=None, raw=False, timeout=30):
+        for attempt in (0, 1):
+            h = {"apikey": self.anon, "Authorization": "Bearer " + self.token(), **(headers or {})}
+            data = None
+            if isinstance(body, (bytes, bytearray)):
+                data = bytes(body)
+            elif body is not None:
+                data = json.dumps(body, ensure_ascii=False).encode()
+                h.setdefault("Content-Type", "application/json")
+            req = urllib.request.Request(self.url + path, data=data, method=method, headers=h)
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    out = r.read()
+                return out if raw else (json.loads(out) if out else None)
+            except urllib.error.HTTPError as e:
+                txt = e.read().decode("utf-8", "replace")
+                if e.code == 401 and attempt == 0:
+                    with self._lock:
+                        self._exp = 0  # Zugriffstoken abgelaufen → einmal erneuern
+                    continue
+                try:
+                    j = json.loads(txt)
+                except ValueError:
+                    j = {}
+                code = str(j.get("code") or j.get("error") or j.get("statusCode") or "")
+                msg = j.get("message") or j.get("msg") or j.get("error") or txt[:300] or f"HTTP {e.code}"
+                if code == "VS403":
+                    raise DbAuthError(msg, e.code, code) from None
+                raise DbError(f"Datenbank: {msg}", e.code, code, j.get("details")) from None
+        raise DbAuthError("Anmeldung abgelaufen – bitte neu mit Microsoft anmelden.")
+
+    def rpc(self, name, **args):
+        try:
+            return self.request("POST", f"/rest/v1/rpc/{name}", args)
+        except DbError as e:
+            if e.code == "VS409":
+                cur = None
+                try:
+                    cur = json.loads(e.details) if e.details else None
+                except ValueError:
+                    pass
+                raise Conflict(str(e).removeprefix("Datenbank: "), cur) from None
+            if e.code == "VS404":
+                raise Gone(str(e)) from None
+            raise
+
+    def select(self, table, query):
+        return self.request("GET", f"/rest/v1/{table}?{query}")
+
+    def select_all(self, table, select, order, extra=""):
+        out, off = [], 0
+        while True:
+            page = self.select(table, f"select={select}&order={order}{extra}&limit=1000&offset={off}")
+            out += page
+            if len(page) < 1000:
+                return out
+            off += 1000
+
+    # ----- Dateiablage (Supabase Storage)
+    def upload(self, key, data: bytes):
+        ctype = {"pdf": "application/pdf", "png": "image/png", "json": "application/json"}.get(
+            key.rsplit(".", 1)[-1].lower(), "application/octet-stream")
+        self.request("POST", f"/storage/v1/object/{DB_BUCKET}/{urllib.parse.quote(key)}", data,
+                     headers={"Content-Type": ctype, "x-upsert": "true"}, timeout=120)
+
+    def download(self, key):
+        return self.request("GET", f"/storage/v1/object/authenticated/{DB_BUCKET}/{urllib.parse.quote(key)}",
+                            raw=True, timeout=120)
+
+    def list_files(self, folder, search=""):
+        """{Dateiname: Änderungszeit (Unix)} eines Ordners im Bucket."""
+        out, off = {}, 0
+        while True:
+            page = self.request("POST", f"/storage/v1/object/list/{DB_BUCKET}",
+                                {"prefix": folder, "limit": 1000, "offset": off, "search": search,
+                                 "sortBy": {"column": "name", "order": "asc"}})
+            for f in page:
+                if f.get("id"):  # Ordner-Einträge haben keine id
+                    ts = f.get("updated_at") or f.get("created_at") or ""
+                    try:
+                        out[f["name"]] = dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+                    except ValueError:
+                        out[f["name"]] = 0.0
+            if len(page) < 1000:
+                return out
+            off += 1000
+
+
+class DbBackend:
+    """Gemeinsame Ablage in der Datenbank – gleiche Schnittstelle wie FolderBackend.
+    Aufträge, Ausgeblendete, Einstellungen und Protokoll liegen in Tabellen; Labels, Retouren, Gewichte und die
+    Sendungsverfolgung als Dateien im Bucket „versand“ und lokal gespiegelt unter DB_DIR (die übrigen
+    Programmteile lesen weiter Dateien)."""
+    kind = "db"
+
+    def __init__(self, client: DbClient, user):
+        self.db, self.user = client, user
+        self.root = DB_DIR
+        self.dirs = {k: os.path.join(DB_DIR, k) for k in (*DB_FILE_KINDS, "protokoll")}
+        for d in self.dirs.values():
+            os.makedirs(d, exist_ok=True)
+        self.mutex = threading.Lock()
+        self._remote = {}        # Ordner -> {Name: Zeit} zuletzt bekannter Stand im Bucket
+        self._files_at = 0.0
+        self._lists = {}         # Ordner -> (Zeit, {Name: Zeit}) für pull()
+        self._log_id = None      # letzte gespiegelte Protokollzeile
+
+    # ----- Aufträge
+    def signature(self):
+        sig = self.db.rpc("versand_signatur")
+        if time.time() - self._files_at > DB_FILE_INTERVAL:
+            try:
+                self.sync_files()
+            except OSError:
+                pass
+        return sig
+
+    def load_all(self):
+        rows = self.db.select_all("versand_auftraege", "ref,version,data,created,updated_by,updated_at",
+                                  "created.asc,ref.asc")
+        hidden = {"deleted": {}, "completed": {}}
+        for h in self.db.select_all("versand_ausgeblendet", "ref,kind,at", "ref.asc"):
+            hidden.setdefault(h["kind"], {})[h["ref"]] = h.get("at") or ""
+        self._pull_labels(rows)
+        return rows, hidden
+
+    def put(self, ref, version, data):
+        return self.db.rpc("versand_put", p_ref=ref, p_version=version, p_data=data)
+
+    def claim(self, ref):
+        return self.db.rpc("versand_claim", p_ref=ref, p_timeout_s=LOCK_TIMEOUT)
+
+    def add(self, data):
+        return self.db.rpc("versand_add", p_data=data)
+
+    def hide(self, ref, kind, data=None):
+        self.db.rpc("versand_hide", p_ref=ref, p_kind=kind, p_data=data)
+
+    def archived(self, ref):
+        rows = self.db.select("versand_ausgeblendet", "select=data&ref=eq." + urllib.parse.quote(str(ref)))
+        return (rows[0].get("data") if rows else None) or {}
+
+    def unhide(self, ref):
+        self.db.rpc("versand_unhide", p_ref=ref)
+
+    def get_settings(self):
+        rows = self.db.select("versand_einstellungen", "select=data&id=eq.1")
+        return (rows[0].get("data") if rows else None) or {}
+
+    def put_settings(self, settings):
+        self.db.rpc("versand_settings_put", p_data=settings)
+
+    def log(self, row):
+        self.db.rpc("versand_log", p_zeitpunkt=row[0], p_auftrag=row[1], p_sendungsnummer=row[2],
+                    p_parcel_id=row[3], p_empfaenger=row[4], p_hinweis=row[5])
+
+    # ----- Dateien
+    def _local(self, folder, name):
+        return os.path.join(self.dirs[folder] if folder in self.dirs else self.root, name)
+
+    def _fetch(self, folder, name, ts=None):
+        data = self.db.download(f"{folder}/{name}")
+        path = self._local(folder, name)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+        if ts:
+            os.utime(path, (ts, ts))
+
+    def upload(self, folder, name, data=None):
+        """Datei in den Bucket legen (data oder die lokale Kopie)."""
+        if data is None:
+            with open(self._local(folder, name), "rb") as f:
+                data = f.read()
+        self.db.upload(f"{folder}/{name}", data)
+        self._remote.setdefault(folder, {})[name] = time.time()
+
+    def _pull_labels(self, rows):
+        need = {fn for r in rows for fn in (r.get("data") or {}).get("labels", [])}
+        for fn in need:
+            if not os.path.exists(self._local("labels", fn)):
+                try:
+                    self._fetch("labels", fn)
+                except DbError as e:
+                    if e.status not in (400, 404):  # noch nicht hochgeladen → später erneut
+                        raise
+
+    def _listing(self, folder, max_age=60):
+        """Dateiliste eines Ordners im Bucket, kurz zwischengespeichert (Suche geht dort nur nach Namensanfang)."""
+        at, names = self._lists.get(folder, (0.0, None))
+        if names is None or time.time() - at > max_age:
+            names = self.db.list_files(folder)
+            self._lists[folder] = (time.time(), names)
+        return names
+
+    def pull(self, folder, contains):
+        """Dateien eines Ordners holen, deren Name den Suchtext enthält (z. B. eine Sendungsnummer)."""
+        for fresh in (60, 0):
+            hits = {n: ts for n, ts in self._listing(folder, fresh).items() if contains in n}
+            if hits:
+                break
+        for name, ts in hits.items():
+            if not os.path.exists(self._local(folder, name)):
+                self._fetch(folder, name, ts)
+
+    def pull_data(self, name):
+        """Einzeldatei (z. B. Sendungsverfolgung) holen, wenn im Bucket neuer."""
+        remote = self.db.list_files("daten", name).get(name)
+        path = os.path.join(self.root, name)
+        if remote and (not os.path.exists(path) or remote > os.path.getmtime(path) + 2):
+            self._fetch("daten", name, remote)
+
+    def push_data(self, name):
+        with open(os.path.join(self.root, name), "rb") as f:
+            self.db.upload(f"daten/{name}", f.read())
+
+    def sync_files(self):
+        """Labels/Retouren: fehlende hochladen. Gewichte: in beide Richtungen nach Änderungszeit."""
+        with self.mutex:
+            self._files_at = time.time()
+            for folder in DB_FILE_KINDS:
+                remote = self.db.list_files(folder)
+                self._remote[folder] = remote
+                local = {n: os.path.getmtime(os.path.join(self.dirs[folder], n))
+                         for n in os.listdir(self.dirs[folder]) if not n.endswith(".tmp")}
+                for name, mt in local.items():
+                    if name not in remote or (folder == "gewichte" and mt > remote[name] + 2):
+                        self.upload(folder, name)
+                if folder == "gewichte":
+                    for name, ts in remote.items():
+                        if name not in local or ts > local[name] + 2:
+                            self._fetch(folder, name, ts)
+
+    def refresh_protokoll(self):
+        """Protokoll aus der Datenbank als CSV je Benutzer spiegeln (für Sendungsverfolgung und „Protokoll öffnen“)."""
+        with self.mutex:
+            d = self.dirs["protokoll"]
+            if self._log_id is None:
+                for n in os.listdir(d):
+                    if n.endswith(".csv"):
+                        os.remove(os.path.join(d, n))
+                self._log_id = 0
+            rows = self.db.select_all("versand_protokoll",
+                                      "id,zeitpunkt,benutzer,auftrag,sendungsnummer,parcel_id,empfaenger,hinweis",
+                                      "id.asc", f"&id=gt.{self._log_id}")
+            for r in rows:
+                p = os.path.join(d, re.sub(r"[^\w.-]", "_", r.get("benutzer") or "unbekannt") + ".csv")
+                new = not os.path.exists(p)
+                with open(p, "a", encoding="utf-8-sig" if new else "utf-8", newline="") as f:
+                    w = csv.writer(f, delimiter=";", lineterminator="\r\n")
+                    if new:
+                        w.writerow(["Zeitpunkt", "Benutzer", "Auftragsnummer", "Sendungsnummer", "Parcel-ID",
+                                    "Empfänger", "Hinweis"])
+                    w.writerow([r.get(k) or "" for k in ("zeitpunkt", "benutzer", "auftrag", "sendungsnummer",
+                                                         "parcel_id", "empfaenger", "hinweis")])
+                self._log_id = max(self._log_id, r["id"])
+
+
+def is_db():
+    return BACKEND is not None and getattr(BACKEND, "kind", "") == "db"
+
+
+def migrate_folder_to_db(folder, client: DbClient, progress=lambda text, frac: None):
+    """Netzwerkordner einmalig in die Datenbank übernehmen. Vorhandenes in der Datenbank bleibt unverändert."""
+    fb = FolderBackend(folder, USER)
+    progress("Ordner lesen …", 0.02)
+    records, _ = fb.load_all()
+    hidden = []
+    for name, h in fb._read_many("ausgeblendet").items():
+        h = h or {}
+        hidden.append({"ref": h.get("ref") or name[:-5], "kind": h.get("kind", "deleted"), "by": h.get("by"),
+                       "at": h.get("at"), "data": h.get("data")})
+    settings = {k: v for k, v in fb.get_settings().items() if not k.startswith("_")}
+    log = []
+    for n in sorted(os.listdir(fb.dirs["protokoll"])):
+        if not n.endswith(".csv"):
+            continue
+        with open(os.path.join(fb.dirs["protokoll"], n), encoding="utf-8-sig", newline="") as f:
+            for row in list(csv.reader(f, delimiter=";"))[1:]:
+                row += [""] * (7 - len(row))
+                log.append(dict(zip(("zeitpunkt", "benutzer", "auftrag", "sendungsnummer", "parcel_id",
+                                     "empfaenger", "hinweis"), row[:7])))
+    total = {"auftraege": 0, "ausgeblendet": 0, "protokoll": 0, "dateien": 0}
+    progress("Aufträge übertragen …", 0.05)
+    first = True
+    for key, items, size in (("ausgeblendet", hidden, 500), ("auftraege", records, 200), ("protokoll", log, 1000)):
+        for i in range(0, max(len(items), 1), size):
+            payload = {key: items[i:i + size]}
+            if first:
+                payload["einstellungen"] = settings or None
+                first = False
+            res = client.rpc("versand_import", p=payload)
+            total[key] += res.get(key, 0)
+    files = []
+    for kind in DB_FILE_KINDS:
+        src = os.path.join(folder, kind)
+        if os.path.isdir(src):
+            remote = client.list_files(kind)
+            files += [(kind, n, os.path.join(src, n)) for n in sorted(os.listdir(src))
+                      if os.path.isfile(os.path.join(src, n)) and not n.endswith(".tmp") and n not in remote]
+    track = os.path.join(folder, TRACK_FILE)
+    if os.path.isfile(track) and TRACK_FILE not in client.list_files("daten", TRACK_FILE):
+        files.append(("daten", TRACK_FILE, track))
+    for i, (kind, name, path) in enumerate(files, 1):
+        progress(f"Dateien übertragen ({i}/{len(files)}) …", 0.1 + 0.9 * i / len(files))
+        with open(path, "rb") as f:
+            client.upload(f"{kind}/{name}", f.read())
+        total["dateien"] += 1
+    progress("Fertig.", 1.0)
+    return total, {"auftraege": len(records), "ausgeblendet": len(hidden), "protokoll": len(log),
+                   "dateien": len(files)}
+
+
 # --------------------------------------------------------------------------- Updates über GitHub Releases
 
 def _vtuple(v):
@@ -2171,6 +2669,11 @@ def return_folder():
 
 def return_files(number):
     """Label-PDF (zuerst) und QR-Code einer Retoure aus dem Ordner „retouren“."""
+    if is_db() and number:
+        try:
+            BACKEND.pull("retouren", f"_{number}")
+        except OSError:
+            pass
     try:
         names = os.listdir(return_folder())
     except OSError:
@@ -3228,6 +3731,11 @@ class App(tk.Tk):
         for path, data in zip(files, (pdf, qr)):
             with open(path, "wb") as f:
                 f.write(data)
+            if is_db():
+                try:
+                    BACKEND.upload("retouren", os.path.basename(path), data)
+                except OSError:
+                    pass  # wird beim nächsten Dateiabgleich nachgereicht
         o.tracking, o.parcel_id = number, DHL_RETURN_PREFIX + number
         append_log(o, "Retourenlabel erstellt" + (" (Testumgebung)" if dhl.sandbox else ""))
         if dlg.mail and o.email:
@@ -3702,21 +4210,19 @@ class App(tk.Tk):
     # ----- Gemeinsamer Ordner
     def _init_backend(self):
         global BACKEND, LABEL_DIR
+        mode = storage_mode(self.cfg)
         path = self.cfg["shared_dir"].strip()
-        if not path:
+        if mode == "local" or (mode == "folder" and not path):
+            self._set_share_info()
+            return
+        if mode == "db":
+            self._init_db()
             self._set_share_info()
             return
         try:
             BACKEND = FolderBackend(path, USER)
             LABEL_DIR = BACKEND.dirs["labels"]
-            shared = BACKEND.get_settings()
-            if shared:  # gemeinsame Versandeinstellungen gelten für alle Arbeitsplätze
-                for k in SHARED_SETTINGS:
-                    if shared.get(k) not in (None, ""):
-                        self.cfg[k] = shared[k]
-                self.cfg.save()
-            elif self.cfg["sender_company"].strip():  # erster Platz: eigene Einstellungen teilen
-                BACKEND.put_settings({k: self.cfg[k] for k in SHARED_SETTINGS})
+            self._adopt_shared_settings()
         except OSError as e:
             BACKEND = None
             messagebox.showerror(APP_NAME, f"Der gemeinsame Ordner ist nicht erreichbar:\n{path}\n\n{e}\n\n"
@@ -3724,14 +4230,92 @@ class App(tk.Tk):
                                            "Kollegen nicht. Bitte Netzlaufwerk prüfen und das Tool neu starten.")
         self._set_share_info()
 
+    def _adopt_shared_settings(self):
+        shared = BACKEND.get_settings()
+        if shared:  # gemeinsame Versandeinstellungen gelten für alle Arbeitsplätze
+            for k in SHARED_SETTINGS:
+                if shared.get(k) not in (None, ""):
+                    self.cfg[k] = shared[k]
+            self.cfg.save()
+        elif self.cfg["sender_company"].strip():  # erster Platz: eigene Einstellungen teilen
+            BACKEND.put_settings({k: self.cfg[k] for k in SHARED_SETTINGS})
+
+    def db_login(self, client, parent=None):
+        """Microsoft-Anmeldung im Browser; das Fenster bleibt dabei bedienbar. Rückgabe: versand_ich() oder None."""
+        box = {}
+        cancelled = {"v": False}
+
+        def run():
+            try:
+                client.login(cancel=lambda: cancelled["v"])
+                box["me"] = client.rpc("versand_ich")
+            except Exception as e:
+                box["err"] = e
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        win = tk.Toplevel(parent or self)
+        win.title(APP_NAME)
+        win.transient(parent or self)
+        ttk.Label(win, text="Bitte im Browser mit dem Microsoft-Konto anmelden …", padding=(20, 16, 20, 6)).pack()
+        ttk.Button(win, text="Abbrechen", command=lambda: cancelled.update(v=True)).pack(pady=(0, 14))
+        win.protocol("WM_DELETE_WINDOW", lambda: cancelled.update(v=True))
+        while t.is_alive():
+            win.update()
+            time.sleep(0.05)
+        win.destroy()
+        if "err" in box:
+            if not cancelled["v"]:
+                messagebox.showerror(APP_NAME, f"Anmeldung fehlgeschlagen:\n\n{box['err']}", parent=parent or self)
+            return None
+        return box["me"]
+
+    def _init_db(self):
+        """Gemeinsame Datenbank verbinden (Anmeldung, Freischaltung prüfen, Dateien abgleichen)."""
+        global BACKEND, LABEL_DIR, USER
+        client = DbClient(self.cfg)
+        try:
+            me = None
+            if client.refresh_token:
+                try:
+                    me = client.rpc("versand_ich")
+                except DbAuthError:
+                    me = None
+            if me is None:
+                if not messagebox.askokcancel(APP_NAME, "Das Versandtool arbeitet mit der gemeinsamen Datenbank.\n\n"
+                                                        "Bitte jetzt mit dem Microsoft-Konto anmelden – dazu öffnet "
+                                                        "sich der Browser."):
+                    raise DbAuthError("Anmeldung abgebrochen.")
+                me = self.db_login(client)
+                if me is None:
+                    raise DbAuthError("Anmeldung nicht abgeschlossen.")
+            if not me.get("erlaubt"):
+                raise DbAuthError(f"Das Konto {me.get('email')} ist für das Versandtool noch nicht freigeschaltet. "
+                                  "Bitte beim Administrator melden.")
+            USER = me.get("name") or me.get("email") or USER
+            BACKEND = DbBackend(client, USER)
+            LABEL_DIR = BACKEND.dirs["labels"]
+            self._update_status("Datenbank verbunden, Dateien werden abgeglichen …")
+            self.update_idletasks()
+            BACKEND.sync_files()
+            self._adopt_shared_settings()
+        except OSError as e:
+            BACKEND = None
+            messagebox.showerror(APP_NAME, f"Die gemeinsame Datenbank ist nicht verbunden:\n\n{e}\n\n"
+                                           "Das Tool arbeitet in dieser Sitzung nur lokal. Änderungen sehen die "
+                                           "Kollegen nicht.")
+
     def _set_share_info(self):
+        mode = storage_mode(self.cfg)
+        where = "Datenbank" if mode == "db" else "Gemeinsamer Ordner"
         if BACKEND is None:
-            text, fg = ("Nur lokal" if not self.cfg["shared_dir"].strip() else "Gemeinsamer Ordner NICHT verbunden – nur lokal"), \
-                (C["muted"] if not self.cfg["shared_dir"].strip() else C["red_ink"])
+            local = mode == "local" or (mode == "folder" and not self.cfg["shared_dir"].strip())
+            text, fg = ("Nur lokal" if local else f"{where} NICHT verbunden – nur lokal"), \
+                (C["muted"] if local else C["red_ink"])
         elif self.offline:
-            text, fg = "Gemeinsamer Ordner nicht erreichbar – Änderungen werden nachgereicht", C["red_ink"]
+            text, fg = f"{where} nicht erreichbar – Änderungen werden nachgereicht", C["red_ink"]
         else:
-            text, fg = f"Gemeinsame Liste · angemeldet als {USER}", C["green_ink"]
+            text, fg = f"Gemeinsame Liste{' (Datenbank)' if mode == 'db' else ''} · angemeldet als {USER}", \
+                C["green_ink"]
         self.share_label.configure(text=text, fg=fg)
 
     def _adopt(self, o, rec, keep_lock=False):
@@ -3753,13 +4337,19 @@ class App(tk.Tk):
             messagebox.showerror(APP_NAME, f"Gemeinsame Liste konnte nicht geladen werden:\n{e}")
             return
         if not records and local and local.get("orders") and messagebox.askyesno(
-                APP_NAME, f"Der gemeinsame Ordner ist noch leer.\n\nDeine lokale Arbeitsliste "
+                APP_NAME, f"Die gemeinsame Liste ist noch leer.\n\nDeine lokale Arbeitsliste "
                           f"({len(local['orders'])} Aufträge) dorthin übernehmen, damit die Kollegen sie sehen?"):
             for x in local["orders"]:
                 o = Order.from_dict(x)
                 BACKEND.add(shared_data(o))
                 for fn in o.labels:  # vorhandene Label-PDFs mitnehmen
                     src = os.path.join(APP_DIR, "labels", fn)
+                    if os.path.exists(src) and is_db():
+                        try:
+                            with open(src, "rb") as a:
+                                BACKEND.upload("labels", fn, a.read())
+                        except OSError:
+                            pass
                     if os.path.exists(src) and not os.path.exists(os.path.join(LABEL_DIR, fn)):
                         with open(src, "rb") as a, open(os.path.join(LABEL_DIR, fn), "wb") as b:
                             b.write(a.read())
@@ -5070,11 +5660,32 @@ class SettingsDialog(tk.Toplevel):
                     )
 
     def _p_network(self, pg):
-        g = self._head(pg, "Gemeinsamer Ordner", "Für mehrere Arbeitsplätze: Netzwerkordner, auf den alle schreiben "
-                                                 "dürfen (z. B. \\\\server\\freigabe\\Versand). Leer = nur lokal. "
-                                                 "Nach einer Änderung startet das Tool neu.", top=0)
+        self._head(pg, "Gemeinsame Ablage", "Wo die Arbeitsliste für mehrere Arbeitsplätze liegt. Nach einer "
+                                             "Änderung startet das Tool neu.", top=0).destroy()
+        self.store_mode = tk.StringVar(value=storage_mode(self.cfg))
+        self._cards(pg, self.store_mode, [
+            ("local", "Nur dieser PC", "Keine gemeinsame Liste."),
+            ("folder", "Netzwerkordner", "Liste als Dateien in einem Ordner, auf den alle schreiben dürfen."),
+            ("db", "Datenbank", "Gemeinsame Datenbank (bob-db.fix-das.de), Anmeldung mit dem Microsoft-Konto. "
+                                "Kein Netzlaufwerk nötig.")])
+        g = self._head(pg, "Netzwerkordner", "z. B. \\\\server\\freigabe\\Versand – für die Ablage „Netzwerkordner“ "
+                                             "und als Quelle für die Übernahme in die Datenbank.", top=18)
         self.shared_dir = tk.StringVar(value=self.cfg["shared_dir"])
         self._folder(g, self.shared_dir)
+        g = self._head(pg, "Datenbank", "Anmeldung gilt nur für diesen Windows-Benutzer. Freischalten neuer Konten: "
+                                        "Administrator (Tabelle versand_benutzer).", top=18)
+        self.db_client = DbClient(self.cfg)
+        self.db_state = tk.StringVar(value="angemeldet" if self.db_client.refresh_token else "nicht angemeldet")
+        row = ttk.Frame(g, style="Card.TFrame")
+        row.grid(row=0, column=0, columnspan=3, sticky="w", pady=3)
+        ttk.Button(row, text="Mit Microsoft anmelden", command=self._db_login).pack(side="left")
+        ttk.Button(row, text="Abmelden", command=self._db_logout).pack(side="left", padx=(6, 0))
+        ttk.Label(row, textvariable=self.db_state, style="CardMuted.TLabel").pack(side="left", padx=(12, 0))
+        row = ttk.Frame(g, style="Card.TFrame")
+        row.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 3))
+        ttk.Button(row, text="Netzwerkordner in die Datenbank übernehmen…", command=self._db_migrate).pack(side="left")
+        ttk.Label(row, text="einmalig; Vorhandenes in der Datenbank bleibt unverändert",
+                  style="CardMuted.TLabel").pack(side="left", padx=(12, 0))
         g = self._head(pg, "Updates", f"Installiert ist Version {APP_VERSION}. Neue Versionen werden aus diesem "
                                       "GitHub-Repository geholt.", action=("Jetzt nach Updates suchen", self._check_now),
                        top=18)
@@ -5283,6 +5894,7 @@ class SettingsDialog(tk.Toplevel):
         cfg.s4t_password = self.s4t_pw.get()
         cfg["s4t_cert_sha256"] = self.pin
         cfg["shared_dir"] = self.shared_dir.get().strip()
+        cfg["storage_mode"] = self.store_mode.get()
         cfg["update_repo"] = self._repo()
         cfg["color_theme"] = self.theme.get()
         for k, v in self.custom.items():
@@ -5309,7 +5921,11 @@ class SettingsDialog(tk.Toplevel):
         if not all(x.isdigit() for x in re.split(r"[,;\s]+", v("s4t_status_extra")) if x):
             return "Speed4Trade", "Weitere Status: nur Zahlen, durch Komma getrennt (z. B. 240)."
         new_shared = self.shared_dir.get().strip()
-        if new_shared and new_shared != self.cfg["shared_dir"].strip():
+        if self.store_mode.get() == "folder" and not new_shared:
+            return "Arbeitsplätze", "Für die Ablage „Netzwerkordner“ bitte einen Ordner eintragen."
+        if self.store_mode.get() == "db" and not self.db_client.refresh_token:
+            return "Arbeitsplätze", "Für die Ablage „Datenbank“ bitte zuerst mit Microsoft anmelden."
+        if self.store_mode.get() == "folder" and new_shared != self.cfg["shared_dir"].strip():
             try:  # Schreibrecht prüfen, bevor der Ordner übernommen wird
                 os.makedirs(new_shared, exist_ok=True)
                 probe = os.path.join(new_shared, f".schreibtest_{USER}.tmp")
@@ -5332,7 +5948,8 @@ class SettingsDialog(tk.Toplevel):
                 return False
         colors = any(self.cfg[k] != v for k, v in (("color_theme", self.theme.get()),
                                                    *((k, v.get()) for k, v in self.custom.items())))
-        shared_changed = self.shared_dir.get().strip() != self.cfg["shared_dir"].strip()
+        shared_changed = self.store_mode.get() != storage_mode(self.cfg) or (
+            self.store_mode.get() == "folder" and self.shared_dir.get().strip() != self.cfg["shared_dir"].strip())
         self._apply(self.cfg)
         self.cfg.save()
         if BACKEND is not None and not shared_changed:
@@ -5345,10 +5962,68 @@ class SettingsDialog(tk.Toplevel):
         if colors or shared_changed:
             self._root().restart_pending = True  # App.settings() startet nach dem Fenster neu
             what = " und ".join(w for w, on in (("die neuen Farben", colors),
-                                                ("der gemeinsame Ordner", shared_changed)) if on)
+                                                ("die gemeinsame Ablage", shared_changed)) if on)
             messagebox.showinfo(APP_NAME, f"Das Tool startet jetzt kurz neu, damit {what} übernommen werden.",
                                 parent=self.master)
         return True
+
+    def _db_login(self):
+        me = self._root().db_login(self.db_client, parent=self)
+        if me:
+            self.db_state.set(f"angemeldet als {me.get('name')} ({me.get('email')})"
+                              + ("" if me.get("erlaubt") else " – NOCH NICHT FREIGESCHALTET"))
+
+    def _db_logout(self):
+        self.db_client.logout()
+        self.db_state.set("nicht angemeldet")
+
+    def _db_migrate(self):
+        folder = self.shared_dir.get().strip()
+        if not folder or not os.path.isdir(os.path.join(folder, "auftraege")):
+            messagebox.showerror(APP_NAME, "Bitte oben den bisherigen Netzwerkordner eintragen (er enthält den "
+                                           "Unterordner „auftraege“).", parent=self)
+            return
+        if not self.db_client.refresh_token:
+            messagebox.showerror(APP_NAME, "Bitte zuerst mit Microsoft anmelden.", parent=self)
+            return
+        if not messagebox.askyesno(APP_NAME, f"Inhalt von\n{folder}\n\nin die Datenbank übernehmen? Aufträge, "
+                                             "Archiv, Einstellungen, Protokoll, Labels, Retouren und Gewichte werden "
+                                             "kopiert. Der Ordner selbst bleibt unverändert.", parent=self):
+            return
+        win = tk.Toplevel(self)
+        win.title(APP_NAME)
+        win.transient(self)
+        text = tk.StringVar(value="Start …")
+        ttk.Label(win, textvariable=text, padding=(20, 16, 20, 6), width=60).pack()
+        bar = ttk.Progressbar(win, length=420, maximum=1.0)
+        bar.pack(padx=20, pady=(0, 18))
+        box, state = {}, {"text": "", "frac": 0.0}
+
+        def run():
+            try:
+                box["res"] = migrate_folder_to_db(folder, self.db_client,
+                                                  lambda t, f: state.update(text=t, frac=f))
+            except Exception as e:
+                box["err"] = e
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        while t.is_alive():
+            text.set(state["text"] or "…")
+            bar["value"] = state["frac"]
+            win.update()
+            time.sleep(0.05)
+        win.destroy()
+        if "err" in box:
+            messagebox.showerror(APP_NAME, f"Übernahme abgebrochen:\n\n{box['err']}\n\nBereits Übertragenes "
+                                           "bleibt erhalten, ein erneuter Versuch setzt fort.", parent=self)
+            return
+        new, seen = box["res"]
+        messagebox.showinfo(APP_NAME, "Übernahme abgeschlossen.\n\n"
+                            f"Aufträge: {new['auftraege']} neu (von {seen['auftraege']})\n"
+                            f"Archiv (erledigt/gelöscht): {new['ausgeblendet']} neu (von {seen['ausgeblendet']})\n"
+                            f"Protokollzeilen: {new['protokoll']} neu (von {seen['protokoll']})\n"
+                            f"Dateien: {new['dateien']} hochgeladen\n\n"
+                            "Jetzt oben „Datenbank“ wählen und speichern, damit das Tool damit arbeitet.", parent=self)
 
     def _check_now(self):
         self.cfg["update_repo"] = self._repo()
@@ -5360,6 +6035,12 @@ class SettingsDialog(tk.Toplevel):
             self.master.reload_history(notify=True)
 
     def open_log(self):
+        if is_db():
+            try:
+                BACKEND.refresh_protokoll()
+            except OSError as e:
+                messagebox.showwarning(APP_NAME, f"Protokoll konnte nicht aus der Datenbank geladen werden:\n{e}",
+                                       parent=self)
         if BACKEND is not None:
             os.startfile(BACKEND.dirs["protokoll"])
         elif os.path.exists(LOG_PATH):
