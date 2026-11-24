@@ -123,10 +123,28 @@ grant select on public.versand_benutzer, public.versand_auftraege, public.versan
   public.versand_einstellungen, public.versand_protokoll, public.versand_stand to authenticated;
 
 -- ---------------------------------------------------------------- Funktionen (entsprechen FolderBackend)
+-- Anmeldeversuche nicht freigeschalteter Konten (meldet der Server-Wächter in Teams)
+create table if not exists public.versand_zugriffsversuche (
+  email        text primary key,
+  name         text,
+  erster       timestamptz not null default now(),
+  letzter      timestamptz not null default now(),
+  anzahl       integer not null default 1,
+  gemeldet_am  timestamptz
+);
+alter table public.versand_zugriffsversuche enable row level security;
+revoke all on public.versand_zugriffsversuche from anon, authenticated;
+
 create or replace function public.versand_ich() returns jsonb
-language plpgsql stable security definer set search_path = public as $$
+language plpgsql volatile security definer set search_path = public as $$
+declare ok boolean := versand_erlaubt(); mail text := lower(coalesce(auth.jwt() ->> 'email', ''));
 begin
-  return jsonb_build_object('email', auth.jwt() ->> 'email', 'name', versand_name(), 'erlaubt', versand_erlaubt());
+  if not ok and mail <> '' then
+    insert into versand_zugriffsversuche (email, name) values (mail, versand_name())
+    on conflict (email) do update set letzter = now(), anzahl = versand_zugriffsversuche.anzahl + 1,
+                                      name = excluded.name;
+  end if;
+  return jsonb_build_object('email', auth.jwt() ->> 'email', 'name', versand_name(), 'erlaubt', ok);
 end $$;
 
 create or replace function public.versand_signatur() returns bigint
