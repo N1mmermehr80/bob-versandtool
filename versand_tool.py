@@ -21,10 +21,12 @@ import ssl
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from collections import deque
 from xml.sax.saxutils import escape as xml_escape
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -40,6 +42,37 @@ LOG_PATH = os.path.join(APP_DIR, "sendungen_log.csv")
 SESSION_PATH = os.path.join(APP_DIR, "arbeitsliste.json")
 LABEL_DIR = os.path.join(APP_DIR, "labels")
 PRINT_DIR = os.path.join(APP_DIR, "sammeldruck")
+FEHLER_PATH = os.path.join(APP_DIR, "fehler.log")   # unerwartete Fehler mit Ablauf (für „Fehler melden“)
+EREIGNISSE = deque(maxlen=60)                       # letzte Fehlermeldungen/Warnungen dieser Sitzung
+
+
+def merke(text, detail=""):
+    """Für „Fehler melden“ festhalten: kurze Zeile im Speicher, ausführlicher Ablauf zusätzlich in fehler.log."""
+    stamp = dt.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+    EREIGNISSE.append(f"{stamp} {text}")
+    if not detail:
+        return
+    try:
+        os.makedirs(APP_DIR, exist_ok=True)
+        if os.path.exists(FEHLER_PATH) and os.path.getsize(FEHLER_PATH) > 1_000_000:
+            os.replace(FEHLER_PATH, FEHLER_PATH + ".alt")
+        with open(FEHLER_PATH, "a", encoding="utf-8") as fh:
+            fh.write(f"===== {stamp} {text}\n{detail}\n")
+    except OSError:
+        pass
+
+
+def _merkend(art, fn):
+    def show(title=None, message=None, **kw):
+        merke(f"{art}: {message}")
+        return fn(title, message, **kw)
+    return show
+
+
+messagebox.showerror = _merkend("Fehler", messagebox.showerror)
+messagebox.showwarning = _merkend("Warnung", messagebox.showwarning)
+threading.excepthook = lambda a: merke(f"Fehler im Hintergrund: {a.exc_value!r}",
+                                       "".join(traceback.format_exception(a.exc_type, a.exc_value, a.exc_traceback)))
 DONE_STATES = ("Label erstellt", "bereits vorhanden", "manuell versendet", "teilweise")
 FILTERS = ["Alle", "Offen", "Bitte prüfen", "Nicht sendbar / Fehler", "Ausgewählt", "Versendet",
            "Label ungedruckt", "Nicht exportiert"]
@@ -2745,6 +2778,155 @@ COLS = [("send", "", 96), ("ref", "Auftrag", 70), ("name", "Name", 170), ("compa
         ("tracking", "Sendungsnummer", 170)]
 
 
+SCREENSHOT_PS = r"""
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Drawing
+Add-Type @'
+using System; using System.Runtime.InteropServices;
+public class BobShot {
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+}
+'@
+[void][BobShot]::SetProcessDPIAware()
+$r = New-Object BobShot+RECT
+[void][BobShot]::GetWindowRect([IntPtr][long]$env:BOB_HWND, [ref]$r)
+$w = $r.R - $r.L; $h = $r.B - $r.T
+if ($w -le 0 -or $h -le 0) { throw 'Fenster nicht gefunden' }
+$bmp = New-Object System.Drawing.Bitmap $w, $h
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.CopyFromScreen($r.L, $r.T, 0, 0, $bmp.Size)
+$bmp.Save($env:BOB_PNG, [System.Drawing.Imaging.ImageFormat]::Png)
+"""
+
+
+def screenshot(win):
+    """Bild des Fensters als PNG-Datei (Pfad) oder None. Nur Windows, über PowerShell (keine Zusatzpakete)."""
+    if os.name != "nt":
+        return None
+    import subprocess
+    import tempfile
+    path = os.path.join(tempfile.gettempdir(), f"versandtool_screenshot_{os.getpid()}.png")
+    try:
+        win.update_idletasks()
+        cmd = ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+               base64.b64encode(SCREENSHOT_PS.encode("utf-16-le")).decode()]
+        r = subprocess.run(cmd, env={**os.environ, "BOB_HWND": str(int(win.wm_frame(), 16)), "BOB_PNG": path},
+                           capture_output=True, timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return path if r.returncode == 0 and os.path.exists(path) else None
+    except (OSError, ValueError, tk.TclError, subprocess.TimeoutExpired):
+        return None
+
+
+def report_text():
+    """Protokoll für die Meldung: letzte Meldungen dieser Sitzung + Ende von fehler.log."""
+    parts = ["Letzte Meldungen dieser Sitzung:", *(EREIGNISSE or ["(keine)"])]
+    try:
+        with open(FEHLER_PATH, encoding="utf-8", errors="replace") as fh:
+            tail = fh.read()[-60000:]
+        parts += ["", "Ende von fehler.log:", tail]
+    except OSError:
+        pass
+    return "\n".join(parts)
+
+
+class ReportDialog(tk.Toplevel):
+    """„Fehler melden“: Beschreibung + Screenshot + Protokoll → Ticket im Ticketsystem (über bob-db/meldung)."""
+
+    def __init__(self, master, client, shot, info, hint=""):
+        super().__init__(master)
+        self.client, self.shot, self.info = client, shot, info
+        self.title("Fehler melden")
+        self.resizable(False, False)
+        self.transient(master)
+        f = ttk.Frame(self, padding=14)
+        f.pack(fill="both")
+        ttk.Label(f, text="Was ist passiert?", font=F["section"]).grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(f, text="Was wolltest du tun, was ist stattdessen passiert? Auftragsnummer hilft.",
+                  foreground=C["muted"]).grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(2, 6))
+        self.text = tk.Text(f, width=64, height=9, font=F["body"], wrap="word", relief="flat", highlightthickness=1,
+                            highlightbackground=C["line_strong"], highlightcolor=C["focus"])
+        self.text.grid(row=2, column=0, columnspan=3, sticky="we")
+        if hint:
+            self.text.insert("1.0", hint)
+        self.text.focus_set()
+        self.with_shot = tk.BooleanVar(value=bool(shot))
+        cb = ttk.Checkbutton(f, text="Bildschirmfoto des Fensters anhängen", variable=self.with_shot)
+        cb.grid(row=3, column=0, sticky="w", pady=(10, 0))
+        if shot:
+            ttk.Button(f, text="Ansehen", command=lambda: os.startfile(shot)).grid(row=3, column=1, sticky="w",
+                                                                                  pady=(10, 0), padx=(8, 0))
+        else:
+            cb.state(["disabled"])
+        self.with_log = tk.BooleanVar(value=True)
+        ttk.Checkbutton(f, text="Protokoll anhängen (letzte Fehlermeldungen, Version, PC)",
+                        variable=self.with_log).grid(row=4, column=0, sticky="w", pady=(4, 0))
+        ttk.Button(f, text="Ansehen", command=self._show_log).grid(row=4, column=1, sticky="w", pady=(4, 0),
+                                                                    padx=(8, 0))
+        b = ttk.Frame(f)
+        b.grid(row=5, column=0, columnspan=3, sticky="e", pady=(14, 0))
+        self.btn = ttk.Button(b, text="Meldung senden", command=self.send)
+        self.btn.pack(side="left")
+        ttk.Button(b, text="Abbrechen", command=self.destroy).pack(side="left", padx=(6, 0))
+        self.bind("<Escape>", lambda e: self.destroy())
+        center_over(self, master)
+        self.grab_set()
+
+    def _log(self):
+        return "\n".join(f"{k}: {v}" for k, v in self.info.items()) + "\n\n" + report_text()
+
+    def _show_log(self):
+        import tempfile
+        path = os.path.join(tempfile.gettempdir(), f"versandtool_protokoll_{os.getpid()}.txt")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(self._log())
+        os.startfile(path)
+
+    def send(self):
+        text = self.text.get("1.0", "end").strip()
+        if len(text) < 5:
+            messagebox.showinfo(APP_NAME, "Bitte kurz beschreiben, was passiert ist.", parent=self)
+            return
+        body = {"text": text, "info": self.info}
+        if self.with_log.get():
+            body["protokoll"] = self._log()
+        if self.with_shot.get() and self.shot:
+            try:
+                with open(self.shot, "rb") as fh:
+                    body["screenshot"] = base64.b64encode(fh.read()).decode()
+            except OSError:
+                pass
+        self.btn.state(["disabled"])
+        self.configure(cursor="watch")
+        box = {}
+
+        def work():
+            try:
+                box["nr"] = self.client.request("POST", "/meldung/v1", body, timeout=90)["nummer"]
+            except Exception as e:  # noqa: BLE001 – Meldung soll nie das Programm stören
+                box["err"] = e
+
+        t = threading.Thread(target=work, daemon=True)
+        t.start()
+
+        def wait():
+            if t.is_alive():
+                self.after(200, wait)
+                return
+            self.configure(cursor="")
+            if "err" in box:
+                self.btn.state(["!disabled"])
+                messagebox.showerror(APP_NAME, f"Meldung konnte nicht gesendet werden:\n\n{box['err']}", parent=self)
+                return
+            master = self.master
+            self.destroy()
+            messagebox.showinfo(APP_NAME, f"Danke! Die Meldung ist als Ticket Nr. {box['nr']} eingegangen.",
+                                parent=master)
+        wait()
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -2979,6 +3161,11 @@ class App(tk.Tk):
                  anchor="w").grid(row=0, column=1, sticky="ew")
         self.progress = ttk.Progressbar(sb, length=180, mode="determinate", style="Signal.Horizontal.TProgressbar")
         self.progress.grid(row=0, column=3, sticky="e")
+        bug = tk.Label(sb, text="Fehler melden", bg=C["hall"], fg=C["muted"], font=F["small"], cursor="hand2")
+        bug.grid(row=0, column=4, sticky="e", padx=(14, 0))
+        bug.bind("<Button-1>", lambda e: self.report_bug())
+        bug.bind("<Enter>", lambda e: bug.configure(fg=C["ink"]))
+        bug.bind("<Leave>", lambda e: bug.configure(fg=C["muted"]))
         legend = tk.Frame(sb, bg=C["hall"])
         tk.Label(legend, text="Farben:", bg=C["hall"], fg=C["muted"], font=F["small"]).pack(side="left", padx=(0, 6))
         for bg, fg, txt in ((C["amber_bg"], C["amber_ink"], "prüfen"), (C["red_bg"], C["red_ink"], "nicht sendbar"),
@@ -2990,7 +3177,7 @@ class App(tk.Tk):
         def place_legend(e=None, state={"inline": None}):
             # Platz für Freigabe-Info, Legende, Fortschritt und mind. 420 px Statustext
             need = (self.share_label.winfo_reqwidth() + legend.winfo_reqwidth() + self.progress.winfo_reqwidth()
-                    + 420 + 60)
+                    + bug.winfo_reqwidth() + 420 + 74)
             inline = sb.winfo_width() >= need
             if inline == state["inline"]:
                 return
@@ -2998,9 +3185,51 @@ class App(tk.Tk):
             if inline:
                 legend.grid(row=0, column=2, sticky="e", padx=(18, 18), pady=0)
             else:
-                legend.grid(row=1, column=0, columnspan=4, sticky="w", padx=0, pady=(6, 0))
+                legend.grid(row=1, column=0, columnspan=5, sticky="w", padx=0, pady=(6, 0))
         sb.bind("<Configure>", place_legend)
         place_legend()
+
+    # ----- Fehler melden
+    def report_callback_exception(self, exc, val, tb):
+        """Unerwarteter Fehler in der Oberfläche: festhalten und anbieten, ihn zu melden."""
+        merke(f"Unerwarteter Fehler: {val!r}", "".join(traceback.format_exception(exc, val, tb)))
+        if getattr(self, "_in_error", False):
+            return
+        self._in_error = True
+        try:
+            if messagebox.askyesno(APP_NAME, f"Unerwarteter Fehler:\n\n{val}\n\nDas Programm läuft weiter. "
+                                             "Jetzt als Fehler melden?", icon="error", parent=self):
+                self.report_bug(hint=f"Unerwarteter Fehler: {val}\n\nWas ich gerade gemacht habe: ")
+        finally:
+            self._in_error = False
+
+    def _report_client(self):
+        if isinstance(BACKEND, DbBackend):
+            return BACKEND.db
+        c = DbClient(self.cfg)
+        return c if c.url and c.anon and c.refresh_token else None
+
+    def report_bug(self, hint=""):
+        client = self._report_client()
+        if client is None:
+            messagebox.showinfo(APP_NAME, "„Fehler melden“ braucht die Anmeldung an der gemeinsamen Datenbank "
+                                          "(Einstellungen → Arbeitsplätze → Datenbank: Adresse, Schlüssel, "
+                                          "„Mit Microsoft anmelden“).\n\nBis dahin den Fehler bitte direkt beim "
+                                          "Administrator melden.", parent=self)
+            return
+        self.configure(cursor="watch")
+        shot = screenshot(self)
+        self.configure(cursor="")
+        sel = [o.ref for o in self.orders if o.selected][:20]
+        focus = self.tree.focus()
+        info = {"Version": APP_VERSION, "PC": os.environ.get("COMPUTERNAME", ""), "Windows-Benutzer":
+                os.environ.get("USERNAME", ""), "Benutzer": USER, "Ablage": storage_mode(self.cfg),
+                "Versand über": self.cfg["carrier"], "Windows": sys.getwindowsversion().build
+                if hasattr(sys, "getwindowsversion") else sys.platform,
+                "Datei/Quelle": os.path.basename(self.source), "Status": self.status.get(),
+                "Markierter Auftrag": self.orders[int(focus)].ref if focus and focus.isdigit()
+                and int(focus) < len(self.orders) else "", "Ausgewählt": ", ".join(sel)}
+        ReportDialog(self, client, shot, info, hint)
 
     # ----- Tabelle
     @staticmethod
