@@ -99,7 +99,7 @@ Ohne Server und ohne Adminrechte: Die Liste liegt in einem **Netzwerkordner**, a
 
 ## Gemeinsame Datenbank (statt Netzwerkordner)
 
-Alternativ zum Netzwerkordner kann die gemeinsame Liste in der Datenbank `bob-db.fix-das.de` (Supabase) liegen. Dann braucht kein PC ein Netzlaufwerk.
+Alternativ zum Netzwerkordner kann die gemeinsame Liste in einer Datenbank (Supabase) liegen. Dann braucht kein PC ein Netzlaufwerk. Adresse und öffentlicher Schlüssel (anon) der Datenbank sind nicht im Programm hinterlegt, sondern werden unter Einstellungen → Arbeitsplätze eingetragen.
 
 **Einrichten** (an jedem PC einmal): **Einstellungen → Arbeitsplätze → Datenbank** wählen, **Mit Microsoft anmelden** (der Browser öffnet sich), speichern. Das Tool startet neu. Unten links steht „Gemeinsame Liste (Datenbank) · angemeldet als <Name>“.
 

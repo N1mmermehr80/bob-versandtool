@@ -68,8 +68,8 @@ DEFAULTS = {
     "use_history": "1",
     "shared_dir": "",
     "storage_mode": "",          # local | folder | db (leer: aus shared_dir abgeleitet)
-    "db_url": "",                # leer = DB_URL
-    "db_anon_key": "",           # leer = DB_ANON_KEY
+    "db_url": "",                # Adresse der Datenbank (muss eingetragen werden)
+    "db_anon_key": "",           # öffentlicher Schlüssel (anon) der Datenbank
     "update_repo": "",
     "label_paper": "A6",
     "print_direct": "0",
@@ -1973,14 +1973,19 @@ class FolderBackend:
 
 # --------------------------------------------------------------------------- Gemeinsame Datenbank (Supabase)
 
-DB_URL = "https://bob-db.fix-das.de"
-# Öffentlicher Schlüssel (anon) – darf im Programm stehen, Zugriff regeln Anmeldung und Datenbankregeln.
-DB_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzk1NTEzNzY5LCJleHAiOjE5NTMxOTM3Njl9.tZw3GbpCGzcy8mC9qnDxOG8Kk-PRcoU00pEOZLEky38"
 DB_LOGIN_PORT = 53683                           # Rücksprung nach der Microsoft-Anmeldung (in Supabase erlaubt)
 DB_DIR = os.path.join(APP_DIR, "datenbank")     # lokale Kopie von Labels, Retouren, Gewichten, Protokoll
 DB_BUCKET = "versand"
 DB_FILE_KINDS = ("labels", "retouren", "gewichte")
 DB_FILE_INTERVAL = 60                           # Dateien höchstens jede Minute abgleichen
+
+
+def db_url(text):
+    """Eingetragene Datenbank-Adresse vereinheitlichen (https:// ergänzen, ohne / am Ende)."""
+    u = text.strip().rstrip("/")
+    if u and not re.match(r"^https?://", u, re.I):
+        u = "https://" + u
+    return u
 
 
 def storage_mode(cfg):
@@ -2011,8 +2016,8 @@ class DbClient:
 
     def __init__(self, cfg):
         self.cfg = cfg
-        self.url = (cfg["db_url"].strip() or DB_URL).rstrip("/")
-        self.anon = cfg["db_anon_key"].strip() or DB_ANON_KEY
+        self.url = db_url(cfg["db_url"])
+        self.anon = cfg["db_anon_key"].strip()
         self._lock = threading.Lock()
         self._access, self._exp = "", 0.0
         self.email = ""
@@ -4274,6 +4279,9 @@ class App(tk.Tk):
         global BACKEND, LABEL_DIR, USER
         client = DbClient(self.cfg)
         try:
+            if not (client.url and client.anon):
+                raise DbError("Es ist keine Datenbank eingetragen. Bitte unter Einstellungen → Arbeitsplätze "
+                              "Adresse und Schlüssel der Datenbank eintragen.")
             me = None
             if client.refresh_token:
                 try:
@@ -5666,23 +5674,26 @@ class SettingsDialog(tk.Toplevel):
         self._cards(pg, self.store_mode, [
             ("local", "Nur dieser PC", "Keine gemeinsame Liste."),
             ("folder", "Netzwerkordner", "Liste als Dateien in einem Ordner, auf den alle schreiben dürfen."),
-            ("db", "Datenbank", "Gemeinsame Datenbank (bob-db.fix-das.de), Anmeldung mit dem Microsoft-Konto. "
-                                "Kein Netzlaufwerk nötig.")])
+            ("db", "Datenbank", "Gemeinsame Datenbank (Adresse unten eintragen), Anmeldung mit dem "
+                                "Microsoft-Konto. Kein Netzlaufwerk nötig.")])
         g = self._head(pg, "Netzwerkordner", "z. B. \\\\server\\freigabe\\Versand – für die Ablage „Netzwerkordner“ "
                                              "und als Quelle für die Übernahme in die Datenbank.", top=18)
         self.shared_dir = tk.StringVar(value=self.cfg["shared_dir"])
         self._folder(g, self.shared_dir)
         g = self._head(pg, "Datenbank", "Anmeldung gilt nur für diesen Windows-Benutzer. Freischalten neuer Konten: "
                                         "Administrator (Tabelle versand_benutzer).", top=18)
+        self._row(g, "Adresse", self._var("db_url"), width=40, note="z. B. https://datenbank.firma.de")
+        self._row(g, "Schlüssel (anon)", self._var("db_anon_key"), width=40, show="•",
+                  note="öffentlicher Schlüssel, vom Administrator")
         self.db_client = DbClient(self.cfg)
         self.db_state = tk.StringVar(value="angemeldet" if self.db_client.refresh_token else "nicht angemeldet")
         row = ttk.Frame(g, style="Card.TFrame")
-        row.grid(row=0, column=0, columnspan=3, sticky="w", pady=3)
+        row.grid(row=2, column=0, columnspan=3, sticky="w", pady=3)
         ttk.Button(row, text="Mit Microsoft anmelden", command=self._db_login).pack(side="left")
         ttk.Button(row, text="Abmelden", command=self._db_logout).pack(side="left", padx=(6, 0))
         ttk.Label(row, textvariable=self.db_state, style="CardMuted.TLabel").pack(side="left", padx=(12, 0))
         row = ttk.Frame(g, style="Card.TFrame")
-        row.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 3))
+        row.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 3))
         ttk.Button(row, text="Netzwerkordner in die Datenbank übernehmen…", command=self._db_migrate).pack(side="left")
         ttk.Label(row, text="einmalig; Vorhandenes in der Datenbank bleibt unverändert",
                   style="CardMuted.TLabel").pack(side="left", padx=(12, 0))
@@ -5923,7 +5934,10 @@ class SettingsDialog(tk.Toplevel):
         new_shared = self.shared_dir.get().strip()
         if self.store_mode.get() == "folder" and not new_shared:
             return "Arbeitsplätze", "Für die Ablage „Netzwerkordner“ bitte einen Ordner eintragen."
-        if self.store_mode.get() == "db" and not self.db_client.refresh_token:
+        if self.store_mode.get() == "db" and not (v("db_url") and v("db_anon_key")):
+            return "Arbeitsplätze", "Für die Ablage „Datenbank“ bitte Adresse und Schlüssel der Datenbank eintragen."
+        if self.store_mode.get() == "db" and (not self.db_client.refresh_token
+                                              or (self.db_client.url and db_url(v("db_url")) != self.db_client.url)):
             return "Arbeitsplätze", "Für die Ablage „Datenbank“ bitte zuerst mit Microsoft anmelden."
         if self.store_mode.get() == "folder" and new_shared != self.cfg["shared_dir"].strip():
             try:  # Schreibrecht prüfen, bevor der Ordner übernommen wird
@@ -5949,8 +5963,11 @@ class SettingsDialog(tk.Toplevel):
         colors = any(self.cfg[k] != v for k, v in (("color_theme", self.theme.get()),
                                                    *((k, v.get()) for k, v in self.custom.items())))
         shared_changed = self.store_mode.get() != storage_mode(self.cfg) or (
-            self.store_mode.get() == "folder" and self.shared_dir.get().strip() != self.cfg["shared_dir"].strip())
+            self.store_mode.get() == "folder" and self.shared_dir.get().strip() != self.cfg["shared_dir"].strip()) or (
+            self.store_mode.get() == "db" and (db_url(self.vars["db_url"].get()) != db_url(self.cfg["db_url"]) or
+                                               self.vars["db_anon_key"].get().strip() != self.cfg["db_anon_key"].strip()))
         self._apply(self.cfg)
+        self.cfg["db_url"] = db_url(self.cfg["db_url"])
         self.cfg.save()
         if BACKEND is not None and not shared_changed:
             try:
@@ -5967,7 +5984,21 @@ class SettingsDialog(tk.Toplevel):
                                 parent=self.master)
         return True
 
+    def _db_target(self):
+        """Eingetragene Datenbank für Anmeldung/Übernahme verwenden; False, wenn nichts eingetragen ist."""
+        url, anon = db_url(self.vars["db_url"].get()), self.vars["db_anon_key"].get().strip()
+        if not (url and anon):
+            messagebox.showerror(APP_NAME, "Bitte zuerst Adresse und Schlüssel der Datenbank eintragen.", parent=self)
+            return False
+        if (url, anon) != (self.db_client.url, self.db_client.anon):
+            if self.db_client.url and url != self.db_client.url and self.db_client.refresh_token:
+                self._db_logout()  # Anmeldung gilt nur für die bisherige Datenbank
+            self.db_client.url, self.db_client.anon = url, anon
+        return True
+
     def _db_login(self):
+        if not self._db_target():
+            return
         me = self._root().db_login(self.db_client, parent=self)
         if me:
             self.db_state.set(f"angemeldet als {me.get('name')} ({me.get('email')})"
@@ -5982,6 +6013,8 @@ class SettingsDialog(tk.Toplevel):
         if not folder or not os.path.isdir(os.path.join(folder, "auftraege")):
             messagebox.showerror(APP_NAME, "Bitte oben den bisherigen Netzwerkordner eintragen (er enthält den "
                                            "Unterordner „auftraege“).", parent=self)
+            return
+        if not self._db_target():
             return
         if not self.db_client.refresh_token:
             messagebox.showerror(APP_NAME, "Bitte zuerst mit Microsoft anmelden.", parent=self)
